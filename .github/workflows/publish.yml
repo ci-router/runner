@@ -1,0 +1,24 @@
+name: publish
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    # GitHub-hosted: free on this public repo, and this org has no other runners.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/ci-router/runner
+        run: |
+          . ./build.env
+          printenv GH_TOKEN | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --build-arg "RUNNER_VERSION=$version" --build-arg "RUNNER_SHA256=$sha256" \
+            -t "$IMAGE:$tag" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$tag"
+          docker push "$IMAGE:latest"

@@ -181,7 +181,8 @@ refuse() {
   exit 1
 }
 
-NODE=$(ls -d "$D"/externals/node*/bin/node 2>/dev/null | sort | tail -n 1)
+# Runner 2.338.2 bundles native node24 and node24_alpine; Ubuntu needs the native binary.
+NODE="$D/externals/node24/bin/node"
 if [ -z "$NODE" ] || [ ! -x "$NODE" ]; then
   echo "ci-router: could not check this job (no Node in the runner), so it was not approved to run on ci-router runners." >&2
   refuse

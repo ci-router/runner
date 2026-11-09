@@ -197,7 +197,7 @@ rm -f ci-router-admission
 if [ -n "$ADMISSION" ]; then printf '%s' "$ADMISSION" > ci-router-admission; fi
 export ACTIONS_RUNNER_HOOK_JOB_STARTED="$PWD/ci-router-job-started.sh"
 
-# As root (these single-use VMs boot as root), the runner refuses to start without this, and exits 0.
+# Root-mode boot needs this flag; nonroot Tenki handoff does not depend on it.
 export RUNNER_ALLOW_RUNASROOT=1
 ./run.sh --jitconfig "$JIT" &
 RUNNER=$!

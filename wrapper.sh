@@ -63,6 +63,29 @@ OOM0=$(awk '/^oom_kill /{print $2}' "$PROCFS/vmstat" 2>/dev/null)
 ( while :; do sample; sleep "$INTERVAL"; done ) >/dev/null 2>&1 &
 SAMPLER=$!
 
+# Phase marks (#215), for the router's overhead report: seconds since this wrapper started, from the
+# VM's own monotonic /proc/uptime (no clock agreement with the router needed). UP0 is the uptime now,
+# so it is also how long the kernel has been up (null where /proc/uptime is unreadable or not the
+# VM's). A watcher notes when the runner listener appears (the JIT config is applied as it starts),
+# when the job's Runner.Worker appears, and when it is gone again. It only reads.
+uptime_now() { awk '{print $1; exit}' "$PROCFS/uptime" 2>/dev/null; }
+UP0=$(uptime_now)
+MARKS="$TMPD/ci-router-marks"
+: > "$MARKS"
+mark() { printf '%s %s\n' "$1" "$(uptime_now)" >> "$MARKS"; }
+(
+  up=0; started=0; ended=0
+  while :; do
+    comms=$(cat "$PROCFS"/[0-9]*/comm 2>/dev/null)
+    if [ "$up" = 0 ] && printf '%s\n' "$comms" | grep -qxF 'Runner.Listener'; then mark up; up=1; fi
+    if printf '%s\n' "$comms" | grep -qxF 'Runner.Worker'; then
+      if [ "$started" = 0 ]; then mark start; started=1; fi
+    elif [ "$started" = 1 ] && [ "$ended" = 0 ]; then mark end; ended=1; fi
+    sleep "${CI_ROUTER_MARK_SEC:-1}"
+  done
+) >/dev/null 2>&1 &
+MARKER=$!
+
 # Job admission: the runner runs this hook before any step of the job it is actually handed (a JIT
 # runner only carries the job's shared labels, so it can receive another queued job). The policy
 # snapshot is not a secret; no snapshot means the hook refuses public-repository jobs. A refusal kills the
@@ -203,8 +226,10 @@ export RUNNER_ALLOW_RUNASROOT=1
 RUNNER=$!
 wait "$RUNNER"
 RC=$?
-kill "$SAMPLER" 2>/dev/null || true
-wait "$SAMPLER" 2>/dev/null || true
+kill "$SAMPLER" "$MARKER" 2>/dev/null || true
+wait "$SAMPLER" "$MARKER" 2>/dev/null || true
+# A worker still listed when the runner exited ends with it.
+if grep -q '^start ' "$MARKS" 2>/dev/null && ! grep -q '^end ' "$MARKS" 2>/dev/null; then mark end; fi
 # Peaks only. A CPU sample here would count the runner's teardown as job time, because
 # the worker has already exited. A job too short for two ticks reports null CPU.
 sample_peaks
@@ -256,11 +281,20 @@ MEMTOTAL=$(num "$(awk '/^MemTotal:/{printf "%d", $2 / 1024}' "$PROCFS/meminfo" 2
 DISKP=$(num "$(awk '$1 ~ /^[0-9]+$/ && $1 + 0 <= 100 && (m == "" || $1 + 0 > m + 0) { m = $1 } END { if (m != "") print m }' "$DISK" 2>/dev/null)")
 VCPUS=$(num "$(awk '/^cpu[0-9]+ /{n++} END { if (n > 0) print n }' "$PROCFS/stat" 2>/dev/null)")
 
+# Seconds since wrapper start of a mark (or now, for poweroff), as a JSON number or null.
+since_start() {
+  num "$(awk -v a="$UP0" -v b="$1" 'BEGIN { if (a ~ /^[0-9.]+$/ && b ~ /^[0-9.]+$/ && b + 0 >= a + 0) printf "%.2f", b - a }')"
+}
+mark_since() { since_start "$(awk -v n="$1" '$1 == n { print $2; exit }' "$MARKS" 2>/dev/null)"; }
+RUNNERUP=$(mark_since up); JOBSTART=$(mark_since start); JOBEND=$(mark_since end)
+POWEROFFSEC=$(since_start "$(uptime_now)")
+UPSTART=$(num "$UP0")
+
 DURATION=$(( $(date +%s) - START ))
 STATUS=failed; [ "$RC" -eq 0 ] && STATUS=done
 
-BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s"}' \
-  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS")
+BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s}' \
+  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC")
 
 curl -fsS -m 10 -X POST "$CIROUTER_TELEMETRY_URL" \
   -H "Authorization: Bearer $TELEMETRY_TOKEN" \

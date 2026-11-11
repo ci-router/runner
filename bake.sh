@@ -4,9 +4,7 @@ set -euo pipefail
 export HOME="${HOME:-/root}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates xz-utils build-essential >/dev/null
-apt-get install -y -qq docker.io docker-compose-v2 >/dev/null
-systemctl enable --now docker >/dev/null 2>&1 || true
+apt-get install -y -qq --no-install-recommends curl ca-certificates xz-utils build-essential >/dev/null
 # Node 22.23.5 from nodejs.org, pinned with its published sha256.
 NODE_DIR=$(mktemp -d)
 curl -fsSL -o "$NODE_DIR/node-v22.23.5-linux-x64.tar.xz" https://nodejs.org/dist/v22.23.5/node-v22.23.5-linux-x64.tar.xz
@@ -41,13 +39,7 @@ tar xzf runner.tar.gz --strip-components=1
 rm -f runner.tar.gz
 ./bin/installdependencies.sh >/dev/null
 ./bin/Runner.Listener --version >/dev/null
-# Warm apt cache: leave the package lists in place for the jobs' own installs.
-apt-get update -qq
-# Sanitize the VM before the snapshot (not for container targets).
-cloud-init clean --logs --seed || true
-: > /etc/machine-id
-rm -f /var/lib/dbus/machine-id
-apt-get clean
-rm -rf /var/lib/cloud/instances
+# Lean container image: no Alpine node builds (only for Docker `container:` jobs), no package lists.
+rm -rf /opt/actions-runner/externals/node*_alpine /var/lib/apt/lists/* /var/cache/apt/*
 # Last: the marker says the steps above all finished.
 printf '%s\n' "2.338.2" > /opt/ci-router/baked

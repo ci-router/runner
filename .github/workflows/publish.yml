@@ -2,6 +2,12 @@ name: publish
 on:
   push:
     branches: [main]
+  # Weekly rebuild (docs/prebaked-images.md): the pinned runner stays well inside GitHub's ~30 day
+  # window, and Node 22.x, Rust stable and the OS packages are refreshed. Each build gets its own
+  # dated tag and prints its digest; a briq that pins a digest keeps its image until the pin moves.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
 permissions:
   contents: read
   packages: write
@@ -17,7 +23,21 @@ jobs:
           IMAGE: ghcr.io/ci-router/runner
         run: |
           . ./build.env
+          # A tag that names one build and never moves (the run number is unique in this repo).
+          dated="$(date -u +%Y-%m-%d)-${GITHUB_RUN_NUMBER}"
+          # The weekly rebuild exists to go stale-proof: say so when the pinned runner is not the latest.
+          latest="$(gh api repos/actions/runner/releases/latest --jq '.tag_name | ltrimstr("v")' 2>/dev/null || true)"
+          if [ -n "$latest" ] && [ "$latest" != "$version" ]; then
+            echo "::warning::actions/runner $latest is out, this image has $version: bump ACTIONS_RUNNER_VERSION in ci-router"
+          fi
           printenv GH_TOKEN | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker build -t "$IMAGE:$tag" -t "$IMAGE:latest" .
-          docker push "$IMAGE:$tag"
-          docker push "$IMAGE:latest"
+          docker build --pull -t "$IMAGE:$tag" -t "$IMAGE:$dated" -t "$IMAGE:latest" .
+          for t in "$tag" "$dated" latest; do docker push "$IMAGE:$t"; done
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$dated")"
+          echo "dated: $IMAGE:$dated"
+          echo "pin: $digest"
+          {
+            echo "### Runner image"
+            echo "- dated tag: \`$IMAGE:$dated\`"
+            echo "- pin (CI_ROUTER_BRIQ_IMAGE): \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

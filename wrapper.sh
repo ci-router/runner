@@ -27,7 +27,17 @@ case "$(awk '{print int($1); exit}' "$PROCFS/uptime" 2>/dev/null)" in ''|*[!0-9]
 now_s() {
   if [ "$CLOCK" = uptime ]; then awk '{print int($1); exit}' "$PROCFS/uptime"; else date +%s; fi
 }
+uptime_now() { awk '{print $1; exit}' "$PROCFS/uptime" 2>/dev/null; }
+now_ms() {
+  if [ "$CLOCK" = uptime ]; then
+    awk '{printf "%.0f", $1 * 1000; exit}' "$PROCFS/uptime"
+  else
+    printf '%s000' "$(date +%s)"
+  fi
+}
 START=$(now_s)
+START_MS=$(now_ms)
+UP0=$(uptime_now)
 
 CPU="$TMPD/ci-router-cpu"
 MEM="$TMPD/ci-router-mem"
@@ -55,10 +65,148 @@ sample_peaks() {
   awk '/^MemAvailable:/{print $2}' "$PROCFS/meminfo" >> "$MEM" 2>/dev/null
   df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}' >> "$DISK"
 }
+
+# Live resource profiles cover the whole wrapper lifetime, independently of the job-only CPU stream
+# above. Each sample is its own atomically renamed file: the sampler can append while a heartbeat is
+# in flight, and a successful post deletes exactly the files it acknowledged. Failed posts therefore
+# leave every sample pending. The number of files is bounded by the wrapper's bounded lifetime.
+PROFILE_DIR="$TMPD/ci-router-profile"
+rm -rf "$PROFILE_DIR"
+mkdir -p "$PROFILE_DIR"
+: > "$PROFILE_DIR/previous-cpu"
+: > "$PROFILE_DIR/sequence"
+: > "$PROFILE_DIR/last-offset"
+PROFILE_REPORT=${CI_ROUTER_PROFILE_REPORT_SEC:-15}
+case "$PROFILE_REPORT" in ''|*[!0-9]*|0) PROFILE_REPORT=15 ;; esac
+
+profile_cpu_pct() {
+  current=$(awk '/^cpu / {
+    if (NF >= 9) {
+      bad = 0; line = ""
+      for (i = 2; i <= 9; i++) { if ($i !~ /^[0-9]+$/) bad = 1; line = line (i > 2 ? " " : "") $i }
+      if (!bad) print line
+    }
+    exit
+  }' "$PROCFS/stat" 2>/dev/null)
+  [ -n "$current" ] || { echo null; return; }
+  previous=$(cat "$PROFILE_DIR/previous-cpu" 2>/dev/null)
+  awk -v c="$current" -v p="$previous" 'BEGIN {
+    nc = split(c, cv, " "); np = split(p, pv, " ")
+    if (nc != 8 || np != 8) { print "null"; exit }
+    total = 0
+    for (i = 1; i <= 8; i++) {
+      if (cv[i] !~ /^[0-9]+$/ || pv[i] !~ /^[0-9]+$/ || cv[i] + 0 < pv[i] + 0) { print "null"; exit }
+      d[i] = cv[i] - pv[i]; total += d[i]
+    }
+    if (total <= 0) { print "null"; exit }
+    v = 100 * (total - d[4] - d[5]) / total
+    if (v < 0) v = 0; if (v > 100) v = 100
+    printf "%.1f", v
+  }'
+  # Even a counter reset advances the baseline: the next point is a delta from this whole-lifetime
+  # observation, never from the job-only file used for the final telemetry.
+  printf '%s
+' "$current" > "$PROFILE_DIR/previous-cpu.tmp.$$"
+  mv "$PROFILE_DIR/previous-cpu.tmp.$$" "$PROFILE_DIR/previous-cpu"
+}
+profile_mem_pct() {
+  value=$(awk '
+    /^MemTotal:/ { t = $2 }
+    /^MemAvailable:/ { a = $2 }
+    END {
+      if (t !~ /^[0-9]+$/ || a !~ /^[0-9]+$/ || t + 0 <= 0) { print "null"; exit }
+      v = 100 * (t - a) / t
+      if (v < 0) v = 0; if (v > 100) v = 100
+      printf "%.1f", v
+    }' "$PROCFS/meminfo" 2>/dev/null)
+  # Some awk implementations skip END when opening the input fails.
+  [ -n "$value" ] || value=null
+  printf '%s' "$value"
+}
+profile_offset_ms() {
+  awk -v start="$START_MS" -v now="$(now_ms)" -v last="$(cat "$PROFILE_DIR/last-offset" 2>/dev/null)" 'BEGIN {
+    if (start !~ /^[0-9]+$/ || now !~ /^[0-9]+$/) {
+      # A mid-run clock read failure must not reuse an idempotency key and drop later observations.
+      if (last ~ /^[0-9]+$/) printf "%d", last + 1; else print 0
+      exit
+    }
+    offset = now - start
+    if (offset < 0) offset = 0
+    # Strictly increasing offsets double as server-side idempotency keys, even on a coarse clock.
+    if (last ~ /^[0-9]+$/ && offset <= last) offset = last + 1
+    printf "%d", offset
+  }'
+}
+sample_profile() {
+  sequence=$(cat "$PROFILE_DIR/sequence" 2>/dev/null)
+  case "$sequence" in ''|*[!0-9]*) sequence=0 ;; esac
+  sequence=$((sequence + 1))
+  printf '%s
+' "$sequence" > "$PROFILE_DIR/sequence"
+  offset=$(profile_offset_ms)
+  printf '%s
+' "$offset" > "$PROFILE_DIR/last-offset"
+  name=$(printf 'sample.%010d' "$sequence")
+  printf '%s %s %s %s
+' "$offset" "$(profile_cpu_pct)" "$(profile_mem_pct)" "$1" > "$PROFILE_DIR/$name.tmp.$$"
+  mv "$PROFILE_DIR/$name.tmp.$$" "$PROFILE_DIR/$name"
+}
 sample() {
-  if worker_running; then sample_cpu; fi
+  if worker_running; then active=true; sample_cpu; else active=false; fi
+  sample_profile "$active"
   sample_peaks
 }
+
+# A single writer avoids overlapping heartbeat requests. One tick per second also makes teardown
+# responsive without signalling a shell that could leave its curl child running beside the final flush.
+post_profiles() (
+  manifest="$PROFILE_DIR/batch"
+  : > "$manifest" || exit 1
+  count=0
+  for file in "$PROFILE_DIR"/sample.*; do
+    [ -f "$file" ] || continue
+    # sample.*.tmp.$$ is still being written/renamed by the sampler, never a completed observation.
+    case "$file" in *.tmp.*) continue ;; esac
+    printf '%s
+' "$file" >> "$manifest"
+    count=$((count + 1))
+    [ "$count" -lt 120 ] || break
+  done
+  if [ "$count" -eq 0 ]; then rm -f "$manifest"; exit 0; fi
+  BODY=$(
+    printf '{"kind":"samples","samples":['
+    separator=
+    while IFS= read -r file; do
+      IFS=' ' read -r offset cpu memory active < "$file"
+      printf '%s{"offsetMs":%s,"cpuPct":%s,"memPct":%s,"jobActive":%s}' "$separator" "$offset" "$cpu" "$memory" "$active"
+      separator=,
+    done < "$manifest"
+    printf ']}'
+  )
+  if curl -fsS -m 10 -X POST "$CIROUTER_TELEMETRY_URL" \
+    -H "Authorization: Bearer $TELEMETRY_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "$BODY"
+  then
+    while IFS= read -r file; do rm -f "$file"; done < "$manifest"
+    result=0
+  else
+    result=1
+  fi
+  rm -f "$manifest"
+  exit "$result"
+)
+(
+  ticks=0
+  while [ ! -f "$PROFILE_DIR/stop" ]; do
+    sleep 1
+    [ ! -f "$PROFILE_DIR/stop" ] || break
+    ticks=$((ticks + 1))
+    if [ "$ticks" -ge "$PROFILE_REPORT" ]; then ticks=0; post_profiles || true; fi
+  done
+) >/dev/null 2>&1 &
+HEARTBEAT=$!
+
 # A JSON number or null: anything that is not a plain non-negative decimal.
 num() {
   case "$1" in
@@ -77,8 +225,6 @@ SAMPLER=$!
 # so it is also how long the kernel has been up (null where /proc/uptime is unreadable or not the
 # VM's). A watcher notes when the runner listener appears (the JIT config is applied as it starts),
 # when the job's Runner.Worker appears, and when it is gone again. It only reads.
-uptime_now() { awk '{print $1; exit}' "$PROCFS/uptime" 2>/dev/null; }
-UP0=$(uptime_now)
 MARKS="$TMPD/ci-router-marks"
 : > "$MARKS"
 mark() { printf '%s %s\n' "$1" "$(uptime_now)" >> "$MARKS"; }
@@ -301,14 +447,32 @@ if [ "$(cat "$LIMIT_FILE" 2>/dev/null)" = cap ]; then
   case "$SEEN_AT" in ''|*[!0-9]*) SEEN_AT= ;; esac
   if [ -n "$SEEN_AT" ] && [ $(($(now_s) - SEEN_AT)) -ge "$MAX_JOB" ]; then RC=124; fi
 fi
+: > "$PROFILE_DIR/stop"
 kill "$LIMITS" 2>/dev/null || true
 kill "$SAMPLER" "$MARKER" 2>/dev/null || true
 wait "$SAMPLER" "$MARKER" 2>/dev/null || true
+# Let an in-flight heartbeat finish before the final drain, so no two sample posts can overlap.
+wait "$HEARTBEAT" 2>/dev/null || true
 # A worker still listed when the runner exited ends with it.
 if grep -q '^start ' "$MARKS" 2>/dev/null && ! grep -q '^end ' "$MARKS" 2>/dev/null; then mark end; fi
-# Peaks only. A CPU sample here would count the runner's teardown as job time, because
-# the worker has already exited. A job too short for two ticks reports null CPU.
+# A final profile point covers teardown, but do not add a CPU sample to the legacy job-only file:
+# that would count the runner's teardown as job time. Peaks remain whole-lifetime.
 sample_peaks
+if worker_running; then active=true; else active=false; fi
+sample_profile "$active"
+# Drain pending batches, oldest first, before the one final telemetry post. A failed batch stays
+# on disk. The TOTAL deadline bounds even a long backlog of slow successful posts: telemetry must
+# never postpone the mandatory poweroff indefinitely (one in-flight curl still has its own 10 s cap).
+FLUSH_SEC=${CI_ROUTER_PROFILE_FLUSH_SEC:-60}
+case "$FLUSH_SEC" in ''|*[!0-9]*) FLUSH_SEC=60 ;; esac
+FLUSH_DEADLINE=$(( $(now_s) + FLUSH_SEC ))
+while [ "$(now_s)" -lt "$FLUSH_DEADLINE" ]; do
+  set -- "$PROFILE_DIR"/sample.*
+  [ -f "$1" ] || break
+  # A transient failure leaves every file pending: retry within the same total deadline instead of
+  # abandoning the rest of the profile. The short sleep also bounds a tight failure loop.
+  post_profiles >/dev/null 2>&1 || sleep 1
+done
 
 OOM1=$(awk '/^oom_kill /{print $2}' "$PROCFS/vmstat" 2>/dev/null)
 OOMKILLS=null

@@ -3,23 +3,17 @@
 # Published from the public repo ci-router/runner, which holds a rendered copy of this file:
 # infra/scripts/publish-runner-image.sh.
 FROM ubuntu:24.04
-ARG RUNNER_VERSION
-ARG RUNNER_SHA256
 LABEL org.opencontainers.image.source="https://github.com/ci-router/runner"
 # A briq's process runs as root, and the VM is destroyed after one job.
 ENV RUNNER_ALLOW_RUNASROOT=1
 RUN apt-get update -qq \
   && apt-get install -y -qq --no-install-recommends \
        build-essential ca-certificates curl git gzip jq openssh-client python3 sudo tar unzip xz-utils zip \
-       >/dev/null \
-  && mkdir -p /opt/actions-runner /opt/ci-router \
-  && cd /opt/actions-runner \
-  && curl -fsSL -o runner.tar.gz \
-       "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
-  && echo "${RUNNER_SHA256}  runner.tar.gz" | sha256sum -c - \
-  && tar xzf runner.tar.gz --strip-components=1 \
-  && rm runner.tar.gz \
-  && ./bin/installdependencies.sh >/dev/null \
-  && rm -rf /var/lib/apt/lists/*
+       >/dev/null
+# The shared bake (renderBakeScript in packages/runner, docs/prebaked-images.md): the pinned runner with
+# its dependencies, docker, Node 22 and Rust, a warm apt cache and the /opt/ci-router/baked marker.
+# The same script bakes the VM images of the other providers. The pinned version and sha256 are in it.
+COPY --chmod=0755 bake.sh /tmp/bake.sh
+RUN /tmp/bake.sh && rm -f /tmp/bake.sh
 COPY --chmod=0755 wrapper.sh /opt/actions-runner/wrapper.sh
 COPY --chmod=0755 entrypoint.sh /opt/ci-router/entrypoint.sh

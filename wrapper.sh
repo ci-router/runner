@@ -12,13 +12,22 @@ set -u
 JIT=$JIT_CONFIG
 TELEMETRY_TOKEN=$CIROUTER_TELEMETRY_TOKEN
 ADMISSION=${CIROUTER_ADMISSION:-}
-unset JIT_CONFIG CIROUTER_TELEMETRY_TOKEN CIROUTER_ADMISSION
+MAX_JOB=${CIROUTER_MAX_JOB_SEC:-}
+unset JIT_CONFIG CIROUTER_TELEMETRY_TOKEN CIROUTER_ADMISSION CIROUTER_MAX_JOB_SEC
 export LC_ALL=C
 PROCFS=${CI_ROUTER_PROC:-/proc}
 TMPD=${CI_ROUTER_TMP:-/tmp}
 INTERVAL=${CI_ROUTER_SAMPLE_SEC:-5}
 cd "${CI_ROUTER_DIR:-/opt/actions-runner}"
-START=$(date +%s)
+# A monotonic clock for every limit below: /proc/uptime does not jump when NTP or the hypervisor steps the
+# wall clock (a forward step would cut a healthy job at the "cap", a backward one would extend it).
+# Chosen once, so the readings are never mixed; without /proc/uptime it is the wall clock.
+CLOCK=date
+case "$(awk '{print int($1); exit}' "$PROCFS/uptime" 2>/dev/null)" in ''|*[!0-9]*) ;; *) CLOCK=uptime ;; esac
+now_s() {
+  if [ "$CLOCK" = uptime ]; then awk '{print int($1); exit}' "$PROCFS/uptime"; else date +%s; fi
+}
+START=$(now_s)
 
 CPU="$TMPD/ci-router-cpu"
 MEM="$TMPD/ci-router-mem"
@@ -222,10 +231,77 @@ export ACTIONS_RUNNER_HOOK_JOB_STARTED="$PWD/ci-router-job-started.sh"
 
 # Root-mode boot needs this flag; nonroot Tenki handoff does not depend on it.
 export RUNNER_ALLOW_RUNASROOT=1
-./run.sh --jitconfig "$JIT" &
+# Its own session and process group (setsid), so a stop reaches the listener, the worker and the job's
+# steps together, not just the shell run.sh started.
+if command -v setsid >/dev/null 2>&1; then setsid ./run.sh --jitconfig "$JIT" & else ./run.sh --jitconfig "$JIT" & fi
 RUNNER=$!
+
+# Runtime limits, independent of the router (it may be down). One watcher, three rules:
+#  - idle: no Runner.Worker within IDLE seconds of the start = a registered runner nobody sent a job to
+#    (re-checked once after RECHECK seconds, so a job assigned right at the deadline is not killed);
+#  - cap: the job (first Runner.Worker seen) has run MAX_JOB seconds;
+#  - hard: IDLE + MAX_JOB + 2 x GRACE since the start, whatever else is happening.
+# idle and cap stop the runner (its whole process group: TERM, then KILL after TERM_WAIT), so this wrapper
+# falls through to the telemetry post and the poweroff below (GitHub then fails the job as lost); if it
+# does not get there within GRACE, the watcher powers off itself. The runner is stopped, never the VM
+# first, so the telemetry still goes out. The reason is written to a file the wrapper reads after the
+# runner exits: a cap stop is reported as exit 124, which the router scores as the job's own
+# timeout, not as a runner crash.
+case "$MAX_JOB" in ''|*[!0-9]*|0) MAX_JOB=21600 ;; esac
+IDLE=${CI_ROUTER_IDLE_SEC:-180}
+GRACE=${CI_ROUTER_KILL_GRACE_SEC:-120}
+WATCH=${CI_ROUTER_WATCH_SEC:-2}
+RECHECK=${CI_ROUTER_IDLE_RECHECK_SEC:-5}
+TERM_WAIT=${CI_ROUTER_TERM_WAIT_SEC:-10}
+LIMIT_FILE="$TMPD/ci-router-limit"
+SEEN_FILE="$TMPD/ci-router-seen"
+rm -f "$LIMIT_FILE" "$SEEN_FILE"
+poweroff_now() { poweroff -f; }
+stop_runner() {
+  echo "$1" > "$LIMIT_FILE"
+  kill -TERM "-$RUNNER" 2>/dev/null
+  kill -TERM "$RUNNER" 2>/dev/null
+  sleep "$TERM_WAIT"
+  kill -KILL "-$RUNNER" 2>/dev/null
+  kill -KILL "$RUNNER" 2>/dev/null
+}
+(
+  seen=0; seen_at=0
+  while :; do
+    sleep "$WATCH"
+    now=$(now_s)
+    if [ "$seen" -eq 0 ]; then
+      if worker_running; then seen=1; seen_at=$now; echo "$seen_at" > "$SEEN_FILE"
+      elif [ $((now - START)) -ge "$IDLE" ]; then
+        sleep "$RECHECK"
+        if worker_running; then seen=1; seen_at=$(now_s); echo "$seen_at" > "$SEEN_FILE"
+        else
+          stop_runner idle
+          sleep "$GRACE"; poweroff_now
+        fi
+      fi
+    elif [ $((now - seen_at)) -ge "$MAX_JOB" ]; then
+      stop_runner cap
+      sleep "$GRACE"; poweroff_now
+    fi
+    if [ $((now - START)) -ge $((IDLE + MAX_JOB + 2 * GRACE)) ]; then poweroff_now; fi
+  done
+) >/dev/null 2>&1 &
+LIMITS=$!
 wait "$RUNNER"
 RC=$?
+# A runner the watcher stopped at the cap reports the cap, not the signal that ended it. The marker
+# file lives where the job can write (it runs as this user), so it is not trusted alone: a real cap
+# stop only happens once the job has run MAX_JOB seconds, measured from the moment the watcher first
+# saw the job's worker (the file it wrote), not from the wrapper's start: a job that starts late
+# must not be reported as having hit the cap early. A job that writes "cap" into it earlier, to turn its runner crash into
+# its own "timeout" and hide the failure from scoring, is reported as the crash it was.
+if [ "$(cat "$LIMIT_FILE" 2>/dev/null)" = cap ]; then
+  SEEN_AT=$(cat "$SEEN_FILE" 2>/dev/null)
+  case "$SEEN_AT" in ''|*[!0-9]*) SEEN_AT= ;; esac
+  if [ -n "$SEEN_AT" ] && [ $(($(now_s) - SEEN_AT)) -ge "$MAX_JOB" ]; then RC=124; fi
+fi
+kill "$LIMITS" 2>/dev/null || true
 kill "$SAMPLER" "$MARKER" 2>/dev/null || true
 wait "$SAMPLER" "$MARKER" 2>/dev/null || true
 # A worker still listed when the runner exited ends with it.
@@ -290,7 +366,7 @@ RUNNERUP=$(mark_since up); JOBSTART=$(mark_since start); JOBEND=$(mark_since end
 POWEROFFSEC=$(since_start "$(uptime_now)")
 UPSTART=$(num "$UP0")
 
-DURATION=$(( $(date +%s) - START ))
+DURATION=$(( $(now_s) - START ))
 STATUS=failed; [ "$RC" -eq 0 ] && STATUS=done
 
 BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s}' \

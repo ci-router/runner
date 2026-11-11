@@ -137,6 +137,21 @@ profile_offset_ms() {
     printf "%d", offset
   }'
 }
+# Network (#345): cumulative bytes received and transmitted since boot, "RX TX", over the interfaces
+# that can leave the host (fields 2 and 10 of /proc/net/dev; loopback and container-internal bridges
+# are left out, they would count the same bytes twice). Cumulative on purpose: a lost or replayed
+# sample cannot skew a counter. "null null" where /proc/net/dev is unreadable or has no interface.
+net_bytes() {
+  value=$(awk '
+    NR > 2 {
+      sub(":", " ")
+      if ($1 == "lo" || $1 ~ /^(docker|br-|veth|virbr|cni|flannel)/) next
+      if ($2 ~ /^[0-9]+$/ && $10 ~ /^[0-9]+$/) { rx += $2; tx += $10; seen = 1 }
+    }
+    END { if (seen) printf "%.0f %.0f", rx, tx }' "$PROCFS/net/dev" 2>/dev/null)
+  [ -n "$value" ] || value="null null"
+  printf '%s' "$value"
+}
 sample_profile() {
   sequence=$(cat "$PROFILE_DIR/sequence" 2>/dev/null)
   case "$sequence" in ''|*[!0-9]*) sequence=0 ;; esac
@@ -147,8 +162,8 @@ sample_profile() {
   printf '%s
 ' "$offset" > "$PROFILE_DIR/last-offset"
   name=$(printf 'sample.%010d' "$sequence")
-  printf '%s %s %s %s
-' "$offset" "$(profile_cpu_pct)" "$(profile_mem_pct)" "$1" > "$PROFILE_DIR/$name.tmp.$$"
+  printf '%s %s %s %s %s
+' "$offset" "$(profile_cpu_pct)" "$(profile_mem_pct)" "$1" "$(net_bytes)" > "$PROFILE_DIR/$name.tmp.$$"
   mv "$PROFILE_DIR/$name.tmp.$$" "$PROFILE_DIR/$name"
 }
 sample() {
@@ -177,8 +192,8 @@ post_profiles() (
     printf '{"kind":"samples","samples":['
     separator=
     while IFS= read -r file; do
-      IFS=' ' read -r offset cpu memory active < "$file"
-      printf '%s{"offsetMs":%s,"cpuPct":%s,"memPct":%s,"jobActive":%s}' "$separator" "$offset" "$cpu" "$memory" "$active"
+      IFS=' ' read -r offset cpu memory active netrx nettx < "$file"
+      printf '%s{"offsetMs":%s,"cpuPct":%s,"memPct":%s,"jobActive":%s,"netRxBytes":%s,"netTxBytes":%s}' "$separator" "$offset" "$cpu" "$memory" "$active" "${netrx:-null}" "${nettx:-null}"
       separator=,
     done < "$manifest"
     printf ']}'
@@ -529,6 +544,8 @@ mark_since() { since_start "$(awk -v n="$1" '$1 == n { print $2; exit }' "$MARKS
 RUNNERUP=$(mark_since up); JOBSTART=$(mark_since start); JOBEND=$(mark_since end)
 POWEROFFSEC=$(since_start "$(uptime_now)")
 UPSTART=$(num "$UP0")
+# Bytes received over the VM's whole life so far (#345), same filter and same counters as the samples.
+NETRX=$(num "$(net_bytes | awk '{print $1}')")
 
 # Egress (#232): bytes this VM transmitted since boot over every interface that can leave the host
 # (field 10 of /proc/net/dev; loopback and container-internal bridges are left out, they would count
@@ -544,8 +561,8 @@ NETTX=$(num "$(awk '
 DURATION=$(( $(now_s) - START ))
 STATUS=failed; [ "$RC" -eq 0 ] && STATUS=done
 
-BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s}' \
-  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX")
+BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s}' \
+  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX")
 
 curl -fsS -m 10 -X POST "$CIROUTER_TELEMETRY_URL" \
   -H "Authorization: Bearer $TELEMETRY_TOKEN" \

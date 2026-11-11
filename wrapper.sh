@@ -530,11 +530,22 @@ RUNNERUP=$(mark_since up); JOBSTART=$(mark_since start); JOBEND=$(mark_since end
 POWEROFFSEC=$(since_start "$(uptime_now)")
 UPSTART=$(num "$UP0")
 
+# Egress (#232): bytes this VM transmitted since boot over every interface that can leave the host
+# (field 10 of /proc/net/dev; loopback and container-internal bridges are left out, they would count
+# the same bytes twice). Whole VM lifetime, as providers bill it. Null where /proc/net/dev is unreadable.
+NETTX=$(num "$(awk '
+  NR > 2 {
+    sub(":", " ")
+    if ($1 == "lo" || $1 ~ /^(docker|br-|veth|virbr|cni|flannel)/) next
+    if ($10 ~ /^[0-9]+$/) { s += $10; seen = 1 }
+  }
+  END { if (seen) printf "%.0f", s }' "$PROCFS/net/dev" 2>/dev/null)")
+
 DURATION=$(( $(now_s) - START ))
 STATUS=failed; [ "$RC" -eq 0 ] && STATUS=done
 
-BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s}' \
-  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC")
+BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s}' \
+  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX")
 
 curl -fsS -m 10 -X POST "$CIROUTER_TELEMETRY_URL" \
   -H "Authorization: Bearer $TELEMETRY_TOKEN" \

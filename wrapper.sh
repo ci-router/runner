@@ -315,6 +315,31 @@ function decide(env, eventText, policy) {
   return { ok: true };
 }
 
+// Tested-commit capture (run identity). JOB-REPORTED evidence for duplicate-run analysis, never
+// authoritative: a job step can overwrite the file. It has its own try/catch and runs before the
+// verdict, so an admitted and a refused job are both recorded, and nothing here can change the
+// verdict, the output or the exit code (a missing or unwritable path is ignored). Two lines: the
+// commit GITHUB_SHA and the ref GITHUB_REF; the wrapper validates both before it reports them.
+// A value with a line break is dropped whole: it must not split into the file's other line.
+function oneLine(value) {
+  var v = String(value || '');
+  if (v.indexOf(String.fromCharCode(10)) >= 0 || v.indexOf(String.fromCharCode(13)) >= 0) return '';
+  return v;
+}
+
+function captureTested(env, file) {
+  if (!file) return;
+  var sha = oneLine(env.GITHUB_SHA).slice(0, 100);
+  var ref = oneLine(env.GITHUB_REF).slice(0, 300);
+  fs.writeFileSync(file, [sha, ref].join(String.fromCharCode(10)) + String.fromCharCode(10));
+}
+
+try {
+  captureTested(process.env, process.argv[3]);
+} catch (e) {
+  // ignored on purpose
+}
+
 try {
   var env = process.env;
   var eventText = env.GITHUB_EVENT_PATH ? readText(env.GITHUB_EVENT_PATH) : null;
@@ -380,13 +405,14 @@ if [ -z "$NODE" ] || [ ! -x "$NODE" ]; then
   echo "ci-router: could not check this job (no Node in the runner), so it was not approved to run on ci-router runners." >&2
   refuse
 fi
-if "$NODE" "$D/ci-router-job-started.cjs" "$D/ci-router-admission"; then
+if "$NODE" "$D/ci-router-job-started.cjs" "$D/ci-router-admission" "$D/ci-router-tested"; then
   exit 0
 fi
 refuse
 CI_ROUTER_HOOK_SHIM_EOF
 chmod 0755 ci-router-job-started.sh
-rm -f ci-router-admission
+rm -f ci-router-admission ci-router-tested
+TESTED="$PWD/ci-router-tested"
 if [ -n "$ADMISSION" ]; then printf '%s' "$ADMISSION" > ci-router-admission; fi
 export ACTIONS_RUNNER_HOOK_JOB_STARTED="$PWD/ci-router-job-started.sh"
 
@@ -558,11 +584,25 @@ NETTX=$(num "$(awk '
   }
   END { if (seen) printf "%.0f", s }' "$PROCFS/net/dev" 2>/dev/null)")
 
+# The commit and ref the job saw (GITHUB_SHA / GITHUB_REF), as the job-started hook wrote them. JOB-REPORTED,
+# never authoritative: a job step can overwrite the file. Only values of the exact expected shape are sent
+# (that is also what keeps the printf'd JSON below safe); anything else is null.
+TESTED_SHA=null
+TESTED_REF=null
+if [ -r "$TESTED" ]; then
+  t_sha=$(sed -n 1p "$TESTED" 2>/dev/null | cut -c1-100)
+  t_ref=$(sed -n 2p "$TESTED" 2>/dev/null | cut -c1-300)
+  if printf '%s
+' "$t_sha" | LC_ALL=C grep -Eq '^([0-9a-f]{40}|[0-9a-f]{64})$'; then TESTED_SHA=$(printf '"%s"' "$t_sha"); fi
+  if printf '%s
+' "$t_ref" | LC_ALL=C grep -Eq '^refs/[A-Za-z0-9._/-]{1,255}$'; then TESTED_REF=$(printf '"%s"' "$t_ref"); fi
+fi
+
 DURATION=$(( $(now_s) - START ))
 STATUS=failed; [ "$RC" -eq 0 ] && STATUS=done
 
-BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s}' \
-  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX")
+BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s, "testedSha": %s, "testedRef": %s}' \
+  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX" "$TESTED_SHA" "$TESTED_REF")
 
 curl -fsS -m 10 -X POST "$CIROUTER_TELEMETRY_URL" \
   -H "Authorization: Bearer $TELEMETRY_TOKEN" \

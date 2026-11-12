@@ -3,8 +3,23 @@
 set -euo pipefail
 export HOME="${HOME:-/root}"
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a
+quiet() {
+  local out rc=0
+  out=$(mktemp)
+  "$@" >"$out" </dev/null || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "bake: '$*' failed with exit $rc; its output ends:" >&2
+    tail -n 60 "$out" >&2 || true
+    echo "bake: held packages: $(apt-mark showhold 2>/dev/null | tr '\n' ' ')" >&2
+    dpkg --audit >&2 || true
+  fi
+  rm -f "$out"
+  return "$rc"
+}
+apt_install() { quiet apt-get install -y -qq "$@"; }
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends curl ca-certificates xz-utils build-essential >/dev/null
+apt_install --no-install-recommends curl ca-certificates xz-utils build-essential
 # Node 22.23.5 from nodejs.org, pinned with its published sha256.
 NODE_DIR=$(mktemp -d)
 curl -fsSL -o "$NODE_DIR/node-v22.23.5-linux-x64.tar.xz" https://nodejs.org/dist/v22.23.5/node-v22.23.5-linux-x64.tar.xz
@@ -37,8 +52,15 @@ curl -fsSL -o runner.tar.gz https://github.com/actions/runner/releases/download/
 echo "baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40  runner.tar.gz" | sha256sum -c -
 tar xzf runner.tar.gz --strip-components=1
 rm -f runner.tar.gz
-./bin/installdependencies.sh >/dev/null
-./bin/Runner.Listener --version >/dev/null
+ICU_PKG=$(apt-cache search --names-only '^libicu[0-9]+$' | awk '{print $1}' | sort -V | tail -n 1)
+if [ -n "$ICU_PKG" ]; then apt_install --no-install-recommends "$ICU_PKG"; fi
+quiet ./bin/installdependencies.sh
+if ! ldconfig -p | grep 'libicuuc\.so\.[0-9]' >/dev/null; then
+  echo "bake: no ICU library is installed (the runner needs libicu)" >&2
+  exit 1
+fi
+# ICU is required here even if the environment asks for invariant globalization.
+DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=0 ./bin/Runner.Listener --version >/dev/null
 # Lean container image: no Alpine node builds (only for Docker `container:` jobs), no package lists.
 rm -rf /opt/actions-runner/externals/node*_alpine /var/lib/apt/lists/* /var/cache/apt/*
 # Last: the marker says the steps above all finished.

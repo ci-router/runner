@@ -14,7 +14,9 @@ TELEMETRY_TOKEN=$CIROUTER_TELEMETRY_TOKEN
 ADMISSION=${CIROUTER_ADMISSION:-}
 MAX_JOB=${CIROUTER_MAX_JOB_SEC:-}
 PROBE_HOST=${CIROUTER_PROBE_HOST:-}
+HOST_PROBES=${CIROUTER_HOST_PROBES:-}
 unset JIT_CONFIG CIROUTER_TELEMETRY_TOKEN CIROUTER_ADMISSION CIROUTER_MAX_JOB_SEC CIROUTER_PROBE_HOST
+unset CIROUTER_HOST_PROBES
 export LC_ALL=C
 PROCFS=${CI_ROUTER_PROC:-/proc}
 TMPD=${CI_ROUTER_TMP:-/tmp}
@@ -461,6 +463,91 @@ TESTED="$PWD/ci-router-tested"
 if [ -n "$ADMISSION" ]; then printf '%s' "$ADMISSION" > ci-router-admission; fi
 export ACTIONS_RUNNER_HOOK_JOB_STARTED="$PWD/ci-router-job-started.sh"
 
+# Host-speed probes (#508, #506): a small-file filesystem probe and a fixed single-core CPU loop, run ONCE
+# before the runner starts, and ONLY when the boot environment says so (CIROUTER_HOST_PROBES=1, set by the
+# router for its internal benchmark and pilot runs, never for a customer job: VM time is billed). The
+# runner has not started, so nothing competes with them. They are capped at 5 s of wall time by
+# `timeout` (and by their own soft deadlines), never fail or delay the boot beyond that, and always remove
+# their directory. A probe that fails, times out or cannot be timed reports null for its fields, never 0.
+# The numbers are JOB-REPORTED and shown for comparison only; they feed no billing, placement or authorization.
+HOSTPROBES=null
+if [ "$HOST_PROBES" = 1 ]; then
+  HP_DIR="$PWD/.ci-router-fsprobe"
+  HP_SEC=${CI_ROUTER_HOSTPROBE_SEC:-5}
+  case "$HP_SEC" in [1-5]) ;; *) HP_SEC=5 ;; esac
+  HP_SCRIPT='FILES=${HP_FILES:-2000}
+case "$FILES" in '\'''\''|*[!0-9]*|0) FILES=2000 ;; esac
+[ "$FILES" -le 5000 ] || FILES=5000
+B=${HP_DIR:-$PWD/.ci-router-fsprobe}
+CHUNK=${HP_CHUNK:-3000000}
+case "$CHUNK" in '\'''\''|*[!0-9]*|0) CHUNK=3000000 ;; esac
+ns() {
+  t=$(date +%s%N 2>/dev/null) || return 1
+  case "$t" in '\'''\''|*[!0-9]*) return 1 ;; esac
+  [ "${#t}" -ge 16 ] || return 1
+  printf '\''%s'\'' "$t"
+}
+rate() { awk -v k="$1" -v n="$2" -v d="$3" '\''BEGIN { if (d > 0 && n > 0) print k " " sprintf("%.0f", n * 1e9 / d) }'\''; }
+T0=$(ns) || exit 0
+c=0; S=$T0
+while [ "$c" -lt 10 ]; do
+  awk -v n="$CHUNK" '\''BEGIN { x = 1; for (i = 0; i < n; i++) x = (x * 69069 + 1) % 4294967296; if (x < 0) exit 1 }'\'' || break
+  c=$((c + 1))
+  E=$(ns) || break
+  [ $((E - S)) -lt 2000000000 ] || break
+done
+E=$(ns) || exit 0
+if [ "$c" -gt 0 ] && [ "$E" -gt "$S" ]; then
+  rate cpuScore $((c * CHUNK)) $((E - S))
+  echo "cpuProbeMs $(( (E - S) / 1000000 ))"
+fi
+rm -rf "$B" 2>/dev/null
+mkdir "$B" 2>/dev/null && mkdir "$B/a" "$B/b" 2>/dev/null || { rm -rf "$B" 2>/dev/null; exit 0; }
+F0=$(ns) || { rm -rf "$B" 2>/dev/null; exit 0; }
+i=0
+while [ "$i" -lt "$FILES" ]; do
+  true > "$B/a/f$i" || break
+  i=$((i + 1))
+  if [ $((i % 500)) -eq 0 ]; then N=$(ns) || break; [ $((N - F0)) -lt 3000000000 ] || break; fi
+done
+Z=$(ns) || Z=
+if [ "$i" -eq "$FILES" ] && [ -n "$Z" ]; then
+  echo "fsFiles $FILES"
+  rate fsCreateOpsPerSec "$FILES" $((Z - F0))
+  set -- "$B"/a/f*
+  A=$(ns); miss=0; p=0
+  while [ "$p" -lt 5 ]; do for f; do [ -e "$f" ] || miss=1; done; p=$((p + 1)); done
+  Z=$(ns) || Z=
+  if [ "$miss" -eq 0 ] && [ -n "$Z" ] && [ -n "$A" ]; then rate fsStatOpsPerSec $((FILES * 5)) $((Z - A)); fi
+  A=$(ns)
+  set -- "$@" "$B/b"
+  if ln -- "$@" 2>/dev/null; then
+    Z=$(ns) || Z=
+    if [ -n "$Z" ] && [ -n "$A" ]; then rate fsLinkOpsPerSec "$FILES" $((Z - A)); fi
+  fi
+fi
+rm -rf "$B" 2>/dev/null
+Z=$(ns) && echo "fsProbeMs $(( (Z - F0) / 1000000 ))"
+exit 0
+'
+  HP_OUT=
+  if command -v timeout >/dev/null 2>&1; then
+    HP_OUT=$(HP_DIR=$HP_DIR HP_FILES=${CI_ROUTER_HOSTPROBE_FILES:-} HP_CHUNK=${CI_ROUTER_HOSTPROBE_CHUNK:-} timeout "$HP_SEC" sh -c "$HP_SCRIPT" </dev/null 2>/dev/null) || true
+  else
+    HP_OUT=$( (HP_DIR=$HP_DIR; HP_FILES=${CI_ROUTER_HOSTPROBE_FILES:-}; HP_CHUNK=${CI_ROUTER_HOSTPROBE_CHUNK:-}; eval "$HP_SCRIPT") </dev/null 2>/dev/null ) || true
+  fi
+  rm -rf "$HP_DIR" 2>/dev/null || true
+  # Only the seven known names with plain non-negative integers are kept; anything else is dropped.
+  HOSTPROBES=$(printf '%s
+' "$HP_OUT" | awk '
+    NF == 2 && $2 ~ /^[0-9]+$/ && length($2) <= 15 { m[$1] = $2 }
+    function v(k) { return (k in m) ? m[k] : "null" }
+    END {
+      if (!(("cpuScore" in m) || ("fsCreateOpsPerSec" in m) || ("fsStatOpsPerSec" in m) || ("fsLinkOpsPerSec" in m))) { print "null"; exit }
+      printf "{\"cpuScore\": %s, \"cpuProbeMs\": %s, \"fsFiles\": %s, \"fsCreateOpsPerSec\": %s, \"fsStatOpsPerSec\": %s, \"fsLinkOpsPerSec\": %s, \"fsProbeMs\": %s}\n", v("cpuScore"), v("cpuProbeMs"), v("fsFiles"), v("fsCreateOpsPerSec"), v("fsStatOpsPerSec"), v("fsLinkOpsPerSec"), v("fsProbeMs")
+    }' 2>/dev/null)
+  case "$HOSTPROBES" in "{"*"}") ;; *) HOSTPROBES=null ;; esac
+fi
 # Root-mode boot needs this flag; nonroot Tenki handoff does not depend on it.
 export RUNNER_ALLOW_RUNASROOT=1
 # Its own session and process group (setsid), so a stop reaches the listener, the worker and the job's
@@ -748,8 +835,8 @@ else
 fi
 case "$PROBE_OUT" in "{"*"}") PROBE_JSON=$PROBE_OUT ;; esac
 
-BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s, "testedSha": %s, "testedRef": %s, "probe": %s, "hostCpu": %s, "profileSamplesTaken": %s, "profileStop": %s}' \
-  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX" "$TESTED_SHA" "$TESTED_REF" "$PROBE_JSON" "$HOSTCPU" "$PROFTAKEN" "$PROFSTOP")
+BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s, "testedSha": %s, "testedRef": %s, "probe": %s, "hostCpu": %s, "hostProbes": %s, "profileSamplesTaken": %s, "profileStop": %s}' \
+  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX" "$TESTED_SHA" "$TESTED_REF" "$PROBE_JSON" "$HOSTCPU" "$HOSTPROBES" "$PROFTAKEN" "$PROFSTOP")
 
 curl -fsS -m 10 -X POST "$CIROUTER_TELEMETRY_URL" \
   -H "Authorization: Bearer $TELEMETRY_TOKEN" \

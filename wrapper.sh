@@ -93,7 +93,8 @@ cat > "$PROFILE_DIR/phase.awk" <<'CI_ROUTER_PHASE_AWK_EOF'
 #
 # Privacy: an argument word is read only through tok_next(), only for an executable that has rules, one
 # word at a time, at most three words (eight raw tokens with their flags), and only into memory. No
-# word is printed, written or passed to anything but the table lookup. Only the class id leaves.
+# word is printed, written or passed to anything but the table lookup. Only the class id leaves. A
+# retitled argv[0] is read the same way, once, for an executable that has rules.
 function parse(line,   a, n, i, bar, path, rest, f, fv, cls, ws, kv) {
   n = split(line, a, " ")
   if (n < 2) return
@@ -135,14 +136,24 @@ function normalise(p,   n, root) {
   }
   return n
 }
-# The next argument word after argv[0], or 0 at the end or at the raw-token cap.
-function tok_next(   t) {
+# The next argument word after argv[0], or 0 at the end or at the raw-token cap. A process that retitled
+# itself ("npm install x", "node (vitest 1)") has a space in argv[0]: its words come first, as if they
+# were the arguments, minus a leading word that is the executable itself (TS twin: titleWords).
+function tok_next(   t, n, i, w, k) {
   if (ARGDONE || ARGIDX >= 8) return 0
   if (!ARGOPEN) {
     ARGCMD = "tr '\\0' '\\n' 2>/dev/null < '" P "/" ARGPID "/cmdline'"
     ARGOPEN = 1
     if ((ARGCMD | getline t) <= 0) { ARGDONE = 1; return 0 }
+    TWN = 0; TWI = 0
+    sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+    if (t ~ /[ \t]/) {
+      n = split(t, w, /[ \t]+/)
+      i = (normalise(w[1]) == ARGNAME) ? 2 : 1
+      for (; i <= n && TWN < 8; i++) TW[++TWN] = w[i]
+    }
   }
+  if (TWI < TWN) { TWI++; ARGIDX++; TOK = TW[TWI]; return 1 }
   if ((ARGCMD | getline t) <= 0) { ARGDONE = 1; return 0 }
   ARGIDX++
   TOK = t
@@ -166,12 +177,12 @@ function next_word(node, depth,   t, key) {
     return 1
   }
 }
-function classify(exe, pid,   name, rn, node, depth, w, key, r, child) {
+function classify(exe, pid,   name, rn, node, depth, w, key, r, child, k) {
   name = normalise(exe)
   rn = (name in ALIAS) ? ALIAS[name] : name
   if (!(rn in DEF)) return (name in EXE) ? EXE[name] : "other"
   node = rn; depth = 0; r = ""
-  ARGPID = pid; ARGIDX = 0; ARGOPEN = 0; ARGDONE = 0
+  ARGPID = pid; ARGIDX = 0; ARGOPEN = 0; ARGDONE = 0; ARGNAME = name; TWN = 0; TWI = 0
   for (w = 0; w < 3 && r == ""; w++) {
     if (!next_word(node, depth)) { r = DEF[node]; break }
     key = KEY
@@ -183,6 +194,8 @@ function classify(exe, pid,   name, rn, node, depth, w, key, r, child) {
   if (r == "") r = DEF[node]
   if (ARGOPEN) close(ARGCMD)
   KEY = ""; TOK = ""
+  for (k in TW) delete TW[k]
+  TWN = 0; TWI = 0
   return r
 }
 # The default class of an executable that has rules (no argument is read): where the rest of the
@@ -357,7 +370,7 @@ L node vp run|lint|lint
 N node vp exec|other|0|
 L node vp exec|test-js|jest vitest
 L node vp exec|lint|tsc eslint prettier
-L node|test-js|jest vitest mocha playwright cypress karma ava tap
+L node|test-js|jest vitest (vitest (vitest) processChild.js mocha playwright cypress karma ava tap
 L node|lint|tsc tsgo eslint prettier biome oxlint stylelint dprint markdownlint snyk fossa pyright basedpyright commitlint
 L node|compile-js|esbuild swc rspack rolldown vite webpack rollup next nuxt parcel turbo nx terser babel
 L node|publish|semantic-release wrangler electron-builder app-builder

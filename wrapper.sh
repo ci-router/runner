@@ -92,7 +92,8 @@ cat > "$PROFILE_DIR/phase.awk" <<'CI_ROUTER_PHASE_AWK_EOF'
 # the tests assert both give the same class.
 #
 # Privacy: an argument word is read only through tok_next(), only for an executable that has rules, one
-# word at a time, at most three words (eight raw tokens with their flags), and only into memory. No
+# word at a time, at most three words (eight raw tokens with their flags; 32 for java, whose main class
+# follows its JVM flags, and an @argfile is never opened), and only into memory. No
 # word is printed, written or passed to anything but the table lookup. Only the class id leaves. A
 # retitled argv[0] is read the same way, once, for an executable that has rules.
 function parse(line,   a, n, i, bar, path, rest, f, fv, cls, ws, kv) {
@@ -140,7 +141,7 @@ function normalise(p,   n, root) {
 # itself ("npm install x", "node (vitest 1)") has a space in argv[0]: its words come first, as if they
 # were the arguments, minus a leading word that is the executable itself (TS twin: titleWords).
 function tok_next(   t, n, i, w, k) {
-  if (ARGDONE || ARGIDX >= 8) return 0
+  if (ARGDONE || ARGIDX >= ARGMAX) return 0
   if (!ARGOPEN) {
     ARGCMD = "tr '\\0' '\\n' 2>/dev/null < '" P "/" ARGPID "/cmdline'"
     ARGOPEN = 1
@@ -150,7 +151,7 @@ function tok_next(   t, n, i, w, k) {
     if (t ~ /[ \t]/) {
       n = split(t, w, /[ \t]+/)
       i = (normalise(w[1]) == ARGNAME) ? 2 : 1
-      for (; i <= n && TWN < 8; i++) TW[++TWN] = w[i]
+      for (; i <= n && TWN < ARGMAX; i++) TW[++TWN] = w[i]
     }
   }
   if (TWI < TWN) { TWI++; ARGIDX++; TOK = TW[TWI]; return 1 }
@@ -182,7 +183,7 @@ function classify(exe, pid,   name, rn, node, depth, w, key, r, child, k) {
   rn = (name in ALIAS) ? ALIAS[name] : name
   if (!(rn in DEF)) return (name in EXE) ? EXE[name] : "other"
   node = rn; depth = 0; r = ""
-  ARGPID = pid; ARGIDX = 0; ARGOPEN = 0; ARGDONE = 0; ARGNAME = name; TWN = 0; TWI = 0
+  ARGPID = pid; ARGIDX = 0; ARGOPEN = 0; ARGDONE = 0; ARGNAME = name; ARGMAX = (rn == "java") ? 32 : 8; TWN = 0; TWI = 0
   for (w = 0; w < 3 && r == ""; w++) {
     if (!next_word(node, depth)) { r = DEF[node]; break }
     key = KEY
@@ -524,7 +525,7 @@ L java org.codehaus.plexus.classworlds.launcher.Launcher|test-jvm|test verify
 L java org.codehaus.plexus.classworlds.launcher.Launcher|compile-jvm|compile package install
 L java org.codehaus.plexus.classworlds.launcher.Launcher|publish|deploy
 L java|other|-version --version -jar
-L java|compile-jvm|org.jetbrains.kotlin.cli.jvm.K2JVMCompiler
+L java|compile-jvm|org.gradle.launcher.daemon.bootstrap.GradleDaemon org.jetbrains.kotlin.cli.jvm.K2JVMCompiler
 L java|test-jvm|org.scalatest.tools.Runner org.junit.platform.console.ConsoleLauncher com.google.testing.junit.runner.BazelTestRunner
 N dotnet|other|1|--configuration,--framework,--output,--property,--runtime,-c,-f,-o,-p,-r
 N dotnet tool|other|0|

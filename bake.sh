@@ -3,6 +3,8 @@
 set -euo pipefail
 export HOME="${HOME:-/root}"
 export DEBIAN_FRONTEND=noninteractive
+# This bake is for amd64: a bake on another architecture would pin the wrong binaries.
+if [ "$(uname -m)" != "x86_64" ]; then echo "bake: built for x86_64, this machine is $(uname -m)" >&2; exit 1; fi
 export NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=a
 quiet() {
   local out rc=0

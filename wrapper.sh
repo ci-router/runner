@@ -79,6 +79,572 @@ mkdir -p "$PROFILE_DIR"
 : > "$PROFILE_DIR/previous-cpu"
 : > "$PROFILE_DIR/sequence"
 : > "$PROFILE_DIR/last-offset"
+: > "$PROFILE_DIR/phase-prev"
+# What the job is doing (D23): the awk classifier and its table, written once. Only a class id from a
+# fixed list ever leaves the VM; the table says which executable and which argument words (read in
+# memory, at most three, only while a name is ambiguous) map to which class.
+cat > "$PROFILE_DIR/phase.awk" <<'CI_ROUTER_PHASE_AWK_EOF'
+# Classifies what the job is doing right now (D23). Reads: the previous per-process tick state, a "@@"
+# line, then every /proc/<pid>/stat. Prints one class id, or "-" when no job worker exists, and writes
+# the new tick state to OUT. Processes are the descendants of Runner.Worker; the class is the one that
+# holds at least half of the CPU ticks they used since the last sample, "idle" when they used almost
+# none, "other" otherwise. The table (TABLE) is the one in packages/core; this file is its awk twin and
+# the tests assert both give the same class.
+#
+# Privacy: an argument word is read only through tok_next(), only for an executable that has rules, one
+# word at a time, at most three words (eight raw tokens with their flags), and only into memory. No
+# word is printed, written or passed to anything but the table lookup. Only the class id leaves.
+function parse(line,   a, n, i, bar, path, rest, f, fv, cls, ws, kv) {
+  n = split(line, a, " ")
+  if (n < 2) return
+  if (a[1] == "E") {
+    for (i = 3; i <= n; i++) { EXE[a[i]] = a[2]; KNOWN[a[i]] = 1 }
+    return
+  }
+  if (a[1] == "X") { split(a[2], f, "|"); ALIAS[f[1]] = f[2]; return }
+  rest = substr(line, 3)
+  bar = index(rest, "|")
+  if (bar == 0) return
+  path = substr(rest, 1, bar - 1)
+  rest = substr(rest, bar + 1)
+  if (a[1] == "N") {
+    split(rest, f, "|")
+    DEF[path] = f[1]; SKIP[path] = f[2]
+    n = split(f[3], fv, ",")
+    for (i = 1; i <= n; i++) FV[path SUBSEP fv[i]] = 1
+  } else if (a[1] == "L") {
+    bar = index(rest, "|")
+    cls = substr(rest, 1, bar - 1)
+    n = split(substr(rest, bar + 1), ws, " ")
+    for (i = 1; i <= n; i++) LEAF[path SUBSEP ws[i]] = cls
+  } else if (a[1] == "A") {
+    n = split(rest, ws, " ")
+    for (i = 1; i <= n; i++) { split(ws[i], kv, "="); AL[path SUBSEP kv[1]] = kv[2] }
+  }
+}
+function normalise(p,   n, root) {
+  sub(/ \(deleted\)$/, "", p)
+  sub(/^.*\//, "", p)
+  n = p
+  if (n == "nodejs") return "node"
+  if (n ~ /^python([0-9]+(\.[0-9]+)*)?$/) return "python3"
+  if (n ~ /^(ruby|php|perl)[0-9]+(\.[0-9]+)*$/) { sub(/[0-9.]+$/, "", n); return n }
+  if (match(n, /-[0-9]+(\.[0-9]+)*$/)) {
+    root = substr(n, 1, RSTART - 1)
+    if (root != "" && (root in KNOWN)) return root
+  }
+  return n
+}
+# The next argument word after argv[0], or 0 at the end or at the raw-token cap.
+function tok_next(   t) {
+  if (ARGDONE || ARGIDX >= 8) return 0
+  if (!ARGOPEN) {
+    ARGCMD = "tr '\\0' '\\n' 2>/dev/null < '" P "/" ARGPID "/cmdline'"
+    ARGOPEN = 1
+    if ((ARGCMD | getline t) <= 0) { ARGDONE = 1; return 0 }
+  }
+  if ((ARGCMD | getline t) <= 0) { ARGDONE = 1; return 0 }
+  ARGIDX++
+  TOK = t
+  return 1
+}
+# The next word of the command line at this node. A token the node's table knows is the word, even
+# with a leading dash (make --version, node yarn.js --immutable); only a dash token with no entry is a
+# flag, skipped (with its value) where the node says so. Sets KEY (the lookup key) and returns 1, or 0
+# at the end of the arguments.
+function next_word(node, depth,   t, key) {
+  for (;;) {
+    if (!tok_next()) return 0
+    t = TOK
+    key = t
+    if (depth == 0 && substr(t, 1, 1) != "-") sub(/^.*\//, "", key)
+    if ((node SUBSEP key) in AL) key = AL[node SUBSEP key]
+    if (SKIP[node] == 1 && ((node SUBSEP t) in FV)) { if (!tok_next()) return 0; continue }
+    if (((node SUBSEP key) in LEAF) || ((node " " key) in DEF) || ((node SUBSEP t) in AL)) { KEY = key; return 1 }
+    if (SKIP[node] == 1 && substr(t, 1, 1) == "-") continue
+    KEY = key
+    return 1
+  }
+}
+function classify(exe, pid,   name, rn, node, depth, w, key, r, child) {
+  name = normalise(exe)
+  rn = (name in ALIAS) ? ALIAS[name] : name
+  if (!(rn in DEF)) return (name in EXE) ? EXE[name] : "other"
+  node = rn; depth = 0; r = ""
+  ARGPID = pid; ARGIDX = 0; ARGOPEN = 0; ARGDONE = 0
+  for (w = 0; w < 3 && r == ""; w++) {
+    if (!next_word(node, depth)) { r = DEF[node]; break }
+    key = KEY
+    if ((node SUBSEP key) in LEAF) { r = LEAF[node SUBSEP key]; break }
+    child = node " " key
+    if (child in DEF) { node = child; depth++; continue }
+    r = DEF[node]
+  }
+  if (r == "") r = DEF[node]
+  if (ARGOPEN) close(ARGCMD)
+  KEY = ""; TOK = ""
+  return r
+}
+# The default class of an executable that has rules (no argument is read): where the rest of the
+# ambiguous processes land when there are more than the ones read one by one.
+function default_class(exe,   name, rn) {
+  name = normalise(exe)
+  rn = (name in ALIAS) ? ALIAS[name] : name
+  return (rn in DEF) ? DEF[rn] : ((name in EXE) ? EXE[name] : "other")
+}
+function ambiguous(exe,   name, rn) {
+  name = normalise(exe)
+  rn = (name in ALIAS) ? ALIAS[name] : name
+  return rn in DEF
+}
+BEGIN {
+  while ((getline line < TABLE) > 0) parse(line)
+  close(TABLE)
+  if (CLKTCK + 0 <= 0) CLKTCK = 100
+  minbusy = INTERVAL * CLKTCK / 20
+}
+$0 == "@@" { mode = 1; next }
+mode == 0 { PREV[$1] = $2; next }
+{
+  pid = $1
+  if (pid !~ /^[0-9]+$/) next
+  c = $0; sub(/^[0-9]+ \(/, "", c); sub(/\) [^)]*$/, "", c)
+  rest = $0; sub(/^.*\) /, "", rest)
+  if (split(rest, f, " ") < 20) next
+  PPID[pid] = f[2]; COMM[pid] = c; TK[pid] = f[12] + f[13]; ST[pid] = f[20]
+}
+END {
+  for (pid in COMM) if (COMM[pid] == "Runner.Worker") worker = 1
+  if (!worker) { print "-"; exit }
+  total = 0; nc = 0
+  for (pid in COMM) {
+    p = PPID[pid]; steps = 0; under = 0
+    while ((p in COMM) && steps < 64) {
+      if (COMM[p] == "Runner.Worker") { under = 1; break }
+      p = PPID[p]; steps++
+    }
+    if (!under) continue
+    key = pid "." ST[pid]
+    d = TK[pid] - ((key in PREV) ? PREV[key] : 0)
+    if (d < 0) d = 0
+    print key, TK[pid] > OUT
+    total += d
+    if (d > 0) CD[pid] = d
+  }
+  close(OUT)
+  # The executables of the busiest processes, read with ONE ls (a missing or unreadable link prints
+  # nothing: that process is "other", never its writable comm). Bounded, so a fork storm costs one spawn.
+  np = 0; lscmd = ""
+  for (k = 0; k < 256; k++) {
+    best = 0; bd = 0
+    for (pid in CD) if (CD[pid] > bd) { bd = CD[pid]; best = pid }
+    if (best == 0) break
+    delete CD[best]
+    BUSY[best] = bd; np++
+    lscmd = lscmd " '" P "/" best "/exe'"
+  }
+  if (np > 0) {
+    cmd = "ls -l" lscmd " 2>/dev/null"
+    while ((cmd | getline line) > 0) {
+      arrow = index(line, " -> ")
+      if (arrow == 0) continue
+      left = substr(line, 1, arrow - 1); sub(/^.* /, "", left)
+      if (substr(left, 1, length(P) + 1) != P "/") continue
+      id = substr(left, length(P) + 2); sub(/\/exe$/, "", id)
+      if (id in BUSY) EXEOF[id] = substr(line, arrow + 4)
+    }
+    close(cmd)
+  }
+  # Every busy process counts, by the class of its executable. Only those whose executable has rules
+  # need their arguments, and only the busiest 24 of them are read; the rest take the default class.
+  nr = 0
+  for (pid in BUSY) {
+    if (!(pid in EXEOF)) { CT["other"] += BUSY[pid]; continue }
+    if (!ambiguous(EXEOF[pid])) { CT[classify(EXEOF[pid], pid)] += BUSY[pid]; continue }
+    AMB[pid] = BUSY[pid]; nr++
+  }
+  for (k = 0; k < 24 && nr > 0; k++) {
+    best = 0; bd = 0
+    for (pid in AMB) if (AMB[pid] > bd) { bd = AMB[pid]; best = pid }
+    if (best == 0) break
+    delete AMB[best]; nr--
+    CT[classify(EXEOF[best], best)] += bd
+  }
+  for (pid in AMB) CT[default_class(EXEOF[pid])] += AMB[pid]
+  if (total < minbusy) { print "idle"; exit }
+  top = "other"; tv = 0
+  for (cls in CT) if (CT[cls] > tv) { tv = CT[cls]; top = cls }
+  if (tv * 2 < total) top = "other"
+  print top
+}
+CI_ROUTER_PHASE_AWK_EOF
+cat > "$PROFILE_DIR/phase-table" <<'CI_ROUTER_PHASE_TABLE_EOF'
+E git git git-lfs git-annex git-upload-pack git-receive-pack git-remote-http git-remote-https svn
+E install-system apt-get apt apk dpkg dpkg-query rpm pacman zypper tdnf choco winget pkg pkg_add pkgin pkgman nix nix-env snap flatpak systemctl launchctl useradd groupadd locale ldconfig fc-cache udevadm sysctl hdiutil diskutil installer tzutil
+E install-toolchain rustup-init fnm mise volta proto aqua xcode-select
+E install-deps mamba micromamba vcpkg
+E compile-native gcc g++ cc c++ clang clang++ clang-cl cc1 cc1plus ld ld.bfd ld.gold ld.lld lld as ar ranlib collect2 llvm-ar llvm-objcopy objcopy cmake cmake3 ninja jom nmake m4 bison flex pkg-config ccache x86_64-linux-gnu-gcc aarch64-linux-gnu-gcc arm-none-eabi-gcc compile asm pack link cgo ghc stack swiftc swift-frontend swift-driver dart2js gen_snapshot frontend_server dartaotruntime impellerc
+E compile-rust rustc rust-lld
+E compile-js esbuild swc lightningcss sass
+E compile-jvm javac jar jlink
+E test-native ctest FileCheck valgrind qemu-system-x86_64 qemu-aarch64 abidiff
+E test-other xctest xcbeautify xcresulttool launchd_sim miniruby phpdbg
+E lint ruff pyrefly ty clippy-driver rustfmt rust-analyzer gofmt gofumpt goimports golangci-lint staticcheck govulncheck gosec revive errcheck ineffassign nilaway shellcheck trivy hadolint clang-format clang-tidy cppcheck actionlint typos vale astyle uncrustify indent iwyu include-what-you-use infer zizmor prek reviewdog misspell editorconfig-checker kube-linter conftest opa tfsec grype syft cov-build aspell hunspell biome oxlint dprint
+E archive tar zip unzip 7z 7za 7zr gzip gunzip zstd zstdcat xz unxz bzip2 lz4 lzma lzop cpio pigz brotli rar unrar bsdtar zopfli
+E transfer curl wget aws azcopy rclone rsync scp sftp ssh ssh-agent ssh-add ssh-keyscan skopeo crane oras aria2c nc ping dig nslookup xh docker-credential-ecr-login
+E docker-build buildkitd buildctl buildah kaniko img
+E container-ops runc crun ctr kind k3d k3s minikube kubelet docker-proxy containerd-shim containerd-shim-runc-v2 containerd dockerd docker-compose
+E publish goreleaser rpmbuild rpmsign pkgbuild productbuild reprepro changie maturin nfpm dpkg-deb altool notarytool
+E db psql mysql mysqldump sqlite3 redis-cli redis-server mongo pg_isready pg_dump pg_restore createdb dropdb
+X sh|bash
+X dash|bash
+N node|other|1|--eval,--import,--loader,--print,--require,-e,-p,-r
+N node npm|other|1|--prefix,--registry,--workspace,-w
+N node npm run|other|0|
+L node npm run|compile-js|build compile bundle dist
+L node npm run|test-js|test tests
+L node npm run|lint|lint typecheck format
+L node npm run|publish|publish
+N node npm exec|other|0|
+L node npm exec|test-js|jest vitest playwright cypress
+L node npm exec|lint|tsc eslint prettier
+L node npm exec|compile-js|esbuild vite webpack rollup
+L node npm|install-deps|ci install i add uninstall update dedupe prune
+L node npm|test-js|test
+L node npm|publish|publish pack
+N node npx|other|1|--package,-p
+L node npx|test-js|jest vitest playwright cypress
+L node npx|lint|tsc eslint prettier
+L node npx|compile-js|esbuild vite webpack rollup
+N node pnpm|other|1|--dir,--filter,--workspace-root,-C,-F,-w
+N node pnpm run|other|0|
+L node pnpm run|compile-js|build compile bundle dist
+L node pnpm run|test-js|test tests test-node test-browser-no-install smoketest-no-compile
+L node pnpm run|lint|lint typecheck format
+L node pnpm run|publish|publish
+L node pnpm run|install-deps|preinstall install
+N node pnpm exec|other|0|
+L node pnpm exec|test-js|jest vitest playwright cypress
+L node pnpm exec|lint|tsc eslint prettier
+L node pnpm exec|compile-js|esbuild vite webpack rollup
+N node pnpm dlx|other|0|
+L node pnpm dlx|test-js|jest vitest
+L node pnpm dlx|lint|tsc eslint prettier
+L node pnpm dlx|compile-js|esbuild vite
+L node pnpm|install-deps|install i add remove update up dedupe prune fetch import
+L node pnpm|test-js|test
+L node pnpm|publish|publish deploy
+L node pnpm|compile-js|build compile
+L node pnpm|lint|lint typecheck format
+N node yarn|other|1|--cache-folder,--cwd
+N node yarn run|other|0|
+L node yarn run|compile-js|build compile
+L node yarn run|test-js|test
+L node yarn run|lint|lint typecheck format
+L node yarn run|publish|publish
+L node yarn|install-deps|install add remove up link --immutable --immutable-cache
+L node yarn|publish|publish pack
+L node yarn|test-js|test
+L node yarn|compile-js|build build:js compile
+L node yarn|lint|lint check:ts
+N node corepack|other|1|
+L node corepack|install-toolchain|enable prepare
+N node vp|other|1|
+N node vp run|other|0|
+L node vp run|compile-js|build compile
+L node vp run|test-js|test
+L node vp run|lint|lint
+N node vp exec|other|0|
+L node vp exec|test-js|jest vitest
+L node vp exec|lint|tsc eslint prettier
+L node|test-js|jest vitest mocha playwright cypress karma ava tap
+L node|lint|tsc tsgo eslint prettier biome oxlint stylelint dprint markdownlint snyk fossa pyright basedpyright commitlint
+L node|compile-js|esbuild swc rspack rolldown vite webpack rollup next nuxt parcel turbo nx terser babel
+L node|publish|semantic-release wrangler electron-builder app-builder
+L node|db|mongosh
+A node|npm-cli.js=npm npx-cli.js=npx pnpm.cjs=pnpm yarn.js=yarn corepack.cjs=corepack
+N python3|other|0|
+N python3 -m|other|0|
+N python3 -m spin|other|0|
+L python3 -m spin|compile-native|build
+L python3 -m spin|test-python|test
+L python3 -m spin|lint|lint
+L python3 -m|install-deps|pip pip3 ensurepip
+L python3 -m|install-toolchain|pipx
+L python3 -m|test-python|pytest unittest tox nox coverage
+L python3 -m|lint|mypy ruff flake8 pylint black isort pyright basedpyright yamllint pre_commit semgrep checkov scancode reuse lintrunner pyspelling doc8 linkchecker
+L python3 -m|publish|build twine flit cloudsmith
+L python3 -m|db|alembic
+L python3 -m|compile-native|meson
+L python3 -m|install-system|dnf yum yum-builddep add-apt-repository apt-add-repository
+L python3 -m|transfer|az gcloud gsutil
+N python3 spin|other|0|
+L python3 spin|compile-native|build
+L python3 spin|test-python|test
+L python3 spin|lint|lint
+N python3 meson|other|0|
+L python3 meson|compile-native|compile setup install
+L python3 meson|test-native|test
+N python3 poetry|other|1|
+N python3 poetry run|other|0|
+L python3 poetry run|test-python|pytest
+L python3 poetry run|lint|mypy ruff
+L python3 poetry|install-deps|install add update lock
+L python3 poetry|publish|publish build
+L python3 poetry|lint|check
+N python3 conda|other|1|
+N python3 conda env|other|0|
+L python3 conda env|install-deps|create update
+L python3 conda|install-deps|install create update
+L python3|other|-c -
+L python3|install-deps|pip pip3
+L python3|test-python|pytest tox nox unittest coverage
+L python3|lint|mypy flake8 pylint black isort cpplint yamllint pre-commit semgrep checkov scancode reuse lintrunner pyspelling doc8 linkchecker
+L python3|test-native|lit lnt
+L python3|publish|twine flit cloudsmith
+L python3|db|alembic
+L python3|install-system|dnf yum yum-builddep add-apt-repository apt-add-repository
+L python3|transfer|az gcloud gsutil
+N ruby|other|0|
+N ruby bundle|other|0|
+N ruby bundle exec|other|0|
+L ruby bundle exec|test-other|rspec rake
+L ruby bundle exec|publish|fastlane
+L ruby bundle exec|lint|rubocop
+L ruby bundle|install-deps|install update config add
+N ruby bundler|other|0|
+L ruby bundler|install-deps|install
+L ruby|test-other|rspec xcpretty
+L ruby|install-deps|gem pod
+L ruby|lint|rubocop licensee
+L ruby|publish|fastlane fpm
+L ruby|install-system|brew brew.rb
+L ruby|other|-e -v -ne -r
+N php|other|0|
+N php composer|other|0|
+L php composer|install-deps|install update require remove config
+L php composer|lint|validate
+N php composer.phar|other|0|
+L php composer.phar|install-deps|install update require
+L php|test-other|phpunit pest paratest simple-phpunit
+L php|lint|phpstan psalm php-cs-fixer
+L php|install-deps|pear pecl
+L php|other|-r -d -f -i -v
+N bash|other|1|
+N bash gradlew|other|1|--build-file,--project-dir,-b,-p
+L bash gradlew|test-jvm|test check
+L bash gradlew|compile-jvm|build assemble compileJava compileKotlin jar
+L bash gradlew|publish|publish
+L bash gradlew|lint|lint detekt ktlint
+N bash gradlew.bat|other|1|
+L bash gradlew.bat|test-jvm|test
+L bash gradlew.bat|compile-jvm|build assemble
+L bash gradlew.bat|publish|publish
+N bash gradle|other|1|--project-dir,-p
+L bash gradle|test-jvm|test check
+L bash gradle|compile-jvm|build assemble compileJava jar
+L bash gradle|publish|publish
+L bash gradle|lint|lint
+N bash mvnw|other|1|--file,-D,-P,-f,-gs,-pl,-s
+L bash mvnw|test-jvm|test verify
+L bash mvnw|compile-jvm|compile package install
+L bash mvnw|publish|deploy
+N bash mvnw.cmd|other|1|--file,-D,-P,-f,-pl
+L bash mvnw.cmd|test-jvm|test verify
+L bash mvnw.cmd|compile-jvm|compile package install
+L bash mvnw.cmd|publish|deploy
+N bash mvn|other|1|--file,-D,-P,-f,-gs,-pl,-s
+L bash mvn|test-jvm|test verify
+L bash mvn|compile-jvm|compile package install
+L bash mvn|publish|deploy
+N bash sbt|other|1|-D,-J,-java-home
+L bash sbt|test-jvm|test testOnly
+L bash sbt|compile-jvm|compile package
+L bash sbt|publish|publish
+N bash ant|other|1|
+L bash ant|test-jvm|test
+L bash ant|compile-jvm|jar
+N bash mix|other|1|
+L bash mix|test-other|test
+L bash mix|compile-native|compile
+L bash mix|install-deps|deps.get deps.compile
+L bash mix|publish|hex.publish
+N bash flutter|other|1|
+L bash flutter|test-other|test
+L bash flutter|compile-native|build
+L bash flutter|install-deps|pub
+L bash flutter|lint|analyze
+N bash pyenv|other|0|
+L bash pyenv|install-toolchain|install local
+N bash rbenv|other|0|
+L bash rbenv|install-toolchain|install
+N bash asdf|other|0|
+L bash asdf|install-toolchain|install plugin
+N bash nvm|other|0|
+L bash nvm|install-toolchain|install use
+L bash|compile-native|configure otp_build erlc elixirc libtool
+L bash|compile-jvm|kotlinc scalac proguard
+L bash|lint|codeql sonar-scanner scan-build
+L bash|install-toolchain|sdkmanager cs coursier
+L bash|install-system|apt-key locale-gen service rpmdev-setuptree tzsetup brew
+N perl|other|0|
+L perl|compile-native|Configure configdata.pm autoreconf autoconf automake hipcc
+L perl|lint|scan-build
+L perl|install-deps|cpanm
+L perl|test-native|abi-compliance-checker
+L perl|install-system|update-alternatives dpkg-reconfigure update-rc.d
+N java|other|1|--class-path,-D,-Xms,-Xmx,-classpath,-cp,-jar
+N java org.gradle.wrapper.GradleWrapperMain|other|0|
+L java org.gradle.wrapper.GradleWrapperMain|test-jvm|test check
+L java org.gradle.wrapper.GradleWrapperMain|compile-jvm|build assemble
+L java org.gradle.wrapper.GradleWrapperMain|publish|publish
+N java org.gradle.launcher.GradleMain|other|0|
+L java org.gradle.launcher.GradleMain|test-jvm|test check
+L java org.gradle.launcher.GradleMain|compile-jvm|build assemble
+L java org.gradle.launcher.GradleMain|publish|publish
+N java org.apache.maven.wrapper.MavenWrapperMain|other|0|
+L java org.apache.maven.wrapper.MavenWrapperMain|test-jvm|test verify
+L java org.apache.maven.wrapper.MavenWrapperMain|compile-jvm|compile package install
+L java org.apache.maven.wrapper.MavenWrapperMain|publish|deploy
+N java org.codehaus.plexus.classworlds.launcher.Launcher|other|0|
+L java org.codehaus.plexus.classworlds.launcher.Launcher|test-jvm|test verify
+L java org.codehaus.plexus.classworlds.launcher.Launcher|compile-jvm|compile package install
+L java org.codehaus.plexus.classworlds.launcher.Launcher|publish|deploy
+L java|other|-version --version -jar
+L java|compile-jvm|org.jetbrains.kotlin.cli.jvm.K2JVMCompiler
+L java|test-jvm|org.scalatest.tools.Runner org.junit.platform.console.ConsoleLauncher com.google.testing.junit.runner.BazelTestRunner
+N dotnet|other|1|--configuration,--framework,--output,--property,--runtime,-c,-f,-o,-p,-r
+N dotnet tool|other|0|
+L dotnet tool|install-toolchain|install restore update
+N dotnet workload|other|0|
+L dotnet workload|install-toolchain|install
+N dotnet nuget|other|0|
+L dotnet nuget|publish|push
+L dotnet nuget|install-deps|restore install
+N dotnet paket|other|0|
+L dotnet paket|install-deps|restore install
+L dotnet|install-deps|restore
+L dotnet|test-other|test vstest vstest.console testhost nunit3-console xunit.console coverlet
+L dotnet|lint|dotnet-format format
+L dotnet|other|--info --version
+N cargo|other|1|--features,--manifest-path,--package,--target,-F,-Z,-p
+L cargo|compile-rust|build check rustc
+L cargo|test-native|test nextest fuzz llvm-cov tarpaulin
+L cargo|lint|clippy fmt audit deny
+L cargo|publish|publish
+L cargo|install-toolchain|install uninstall
+L cargo|install-deps|update add remove generate-lockfile vendor
+N go|other|1|-C
+L go|compile-native|build install
+L go|test-native|test
+L go|lint|vet fmt
+L go|install-deps|mod work
+N docker|other|1|--config,--context,--host,--log-level,-H,-c
+L docker|docker-build|build buildx
+L docker|container-ops|run exec compose ps images image tag save load rm stop start create cp inspect commit import export login logout
+L docker|transfer|pull push
+N podman|other|1|--config,--context,--host,-H,-c
+L podman|docker-build|build
+L podman|container-ops|run exec compose image images
+L podman|transfer|pull push
+N make|compile-native|1|-C,-I,-W,-f,-o
+L make|test-native|test tests check
+L make|lint|lint fmt format
+L make|other|docs doc clean --version --help
+N gmake|compile-native|1|-C,-I,-f
+L gmake|test-native|test check
+L gmake|lint|lint
+L gmake|other|clean --version
+N gh|other|1|
+L gh|publish|release
+N uv|other|1|--directory,--project,--python,-p
+N uv pip|other|0|
+L uv pip|install-deps|install sync uninstall
+N uv run|other|0|
+L uv run|test-python|pytest
+L uv run|lint|mypy ruff
+N uv tool|other|0|
+L uv tool|install-toolchain|install
+L uv|install-deps|sync add remove lock export
+L uv|publish|build publish
+N rustup|other|1|
+L rustup|install-toolchain|default update component target toolchain profile override
+N conda|other|1|
+N conda env|other|0|
+L conda env|install-deps|create update
+L conda|install-deps|install create update
+N poetry|other|1|
+N poetry run|other|0|
+L poetry run|test-python|pytest
+L poetry run|lint|mypy ruff
+L poetry|install-deps|install add update lock
+L poetry|publish|publish build
+L poetry|lint|check
+N pixi|other|1|
+N pixi run|other|0|
+L pixi run|test-python|pytest test
+L pixi|install-deps|install add update
+L pixi|publish|publish
+N swift|other|1|
+L swift|compile-native|build
+L swift|test-native|test
+N xcodebuild|other|1|-arch,-configuration,-derivedDataPath,-destination,-destination-timeout,-only-testing,-project,-resultBundlePath,-scheme,-sdk,-skip-testing,-testPlan,-toolchain,-workspace,-xcconfig
+L xcodebuild|test-other|test
+L xcodebuild|compile-native|build archive
+N xcrun|other|1|--sdk,--toolchain
+L xcrun|test-other|simctl
+L xcrun|compile-native|clang swiftc
+L xcrun|publish|notarytool altool
+L xcrun|other|--sdk --show-sdk-path
+N dart|other|1|
+L dart|install-deps|pub
+L dart|test-other|test
+L dart|lint|analyze format
+L dart|compile-native|compile
+N cabal|other|1|
+L cabal|compile-native|build
+L cabal|test-native|test
+L cabal|publish|sdist
+L cabal|install-toolchain|install
+L cabal|install-deps|v2-update update
+L cabal|other|--version --numeric-version
+N spin|other|1|
+L spin|compile-native|build
+L spin|test-python|test
+L spin|lint|lint
+N vp|other|1|
+N vp run|other|0|
+L vp run|compile-js|build compile
+L vp run|test-js|test
+L vp run|lint|lint
+N vp exec|other|0|
+L vp exec|test-js|jest vitest
+L vp exec|lint|tsc eslint prettier
+N corepack|other|1|
+L corepack|install-toolchain|enable prepare
+N pnpm|other|1|--dir,--filter,--workspace-root,-C,-F,-w
+N pnpm run|other|0|
+L pnpm run|compile-js|build compile bundle dist
+L pnpm run|test-js|test tests test-node test-browser-no-install smoketest-no-compile
+L pnpm run|lint|lint typecheck format
+L pnpm run|publish|publish
+L pnpm run|install-deps|preinstall install
+N pnpm exec|other|0|
+L pnpm exec|test-js|jest vitest playwright cypress
+L pnpm exec|lint|tsc eslint prettier
+L pnpm exec|compile-js|esbuild vite webpack rollup
+N pnpm dlx|other|0|
+L pnpm dlx|test-js|jest vitest
+L pnpm dlx|lint|tsc eslint prettier
+L pnpm dlx|compile-js|esbuild vite
+L pnpm|install-deps|install i add remove update up dedupe prune fetch import
+L pnpm|test-js|test
+L pnpm|publish|publish deploy
+L pnpm|compile-js|build compile
+L pnpm|lint|lint typecheck format
+CI_ROUTER_PHASE_TABLE_EOF
+CLKTCK=$(getconf CLK_TCK 2>/dev/null)
+case "$CLKTCK" in ''|*[!0-9]*|0) CLKTCK=100 ;; esac
 PROFILE_REPORT=${CI_ROUTER_PROFILE_REPORT_SEC:-15}
 case "$PROFILE_REPORT" in ''|*[!0-9]*|0) PROFILE_REPORT=15 ;; esac
 
@@ -176,6 +742,17 @@ disk_counters() {
   [ -n "$value" ] || value="null null null null null"
   printf '%s' "$value"
 }
+# The class of what the job's processes are doing since the last sample, or "-" (none known). Always a
+# word of lowercase letters and hyphens; the server keeps it only for a team that has run phases on.
+profile_phase() {
+  [ "$1" = true ] && [ -s "$PROFILE_DIR/phase-table" ] || { printf -- '-'; return; }
+  value=$({ cat "$PROFILE_DIR/phase-prev" 2>/dev/null; echo '@@'; cat "$PROCFS"/[0-9]*/stat 2>/dev/null; } |
+    awk -v TABLE="$PROFILE_DIR/phase-table" -v OUT="$PROFILE_DIR/phase-prev.new" -v P="$PROCFS" -v INTERVAL="$INTERVAL" -v CLKTCK="$CLKTCK" -f "$PROFILE_DIR/phase.awk" 2>/dev/null)
+  if [ -f "$PROFILE_DIR/phase-prev.new" ]; then mv "$PROFILE_DIR/phase-prev.new" "$PROFILE_DIR/phase-prev"; fi
+  case "$value" in ''|*[!a-z-]*) value=- ;; esac
+  case "$value" in ??????????????????????????????????*) value=- ;; esac
+  printf '%s' "$value"
+}
 sample_profile() {
   sequence=$(cat "$PROFILE_DIR/sequence" 2>/dev/null)
   case "$sequence" in ''|*[!0-9]*) sequence=0 ;; esac
@@ -185,9 +762,9 @@ sample_profile() {
 ' "$offset" > "$PROFILE_DIR/last-offset"
   name=$(printf 'sample.%010d' "$sequence")
   cpuio=$(profile_cpu_pct)
-  # One line per sample: OFFSET CPU MEM ACTIVE RX TX IOWAIT RO WO RS WS MS
-  printf '%s %s %s %s %s %s %s
-' "$offset" "${cpuio% *}" "$(profile_mem_pct)" "$1" "$(net_bytes)" "${cpuio#* }" "$(disk_counters)" > "$PROFILE_DIR/$name.tmp.$$"
+  # One line per sample: OFFSET CPU MEM ACTIVE RX TX IOWAIT RO WO RS WS MS PHASE
+  printf '%s %s %s %s %s %s %s %s
+' "$offset" "${cpuio% *}" "$(profile_mem_pct)" "$1" "$(net_bytes)" "${cpuio#* }" "$(disk_counters)" "$(profile_phase "$1")" > "$PROFILE_DIR/$name.tmp.$$"
   mv "$PROFILE_DIR/$name.tmp.$$" "$PROFILE_DIR/$name"
   # Counted only once the sample exists: a sampler killed mid-sample leaves the counter where it was, so
   # "taken" never exceeds what was written (the final sample then reuses that number).
@@ -200,6 +777,13 @@ sample() {
   sample_peaks
 }
 
+# The JSON member for a sample's class, or nothing: only lowercase letters and hyphens ever pass.
+phase_field() {
+  case "$1" in
+    ''|-|*[!a-z-]*) ;;
+    *) printf ',"phase":"%s"' "$1" ;;
+  esac
+}
 # A single writer avoids overlapping heartbeat requests. One tick per second also makes teardown
 # responsive without signalling a shell that could leave its curl child running beside the final flush.
 post_profiles() (
@@ -220,8 +804,8 @@ post_profiles() (
     printf '{"kind":"samples","samples":['
     separator=
     while IFS= read -r file; do
-      IFS=' ' read -r offset cpu memory active netrx nettx iowait dro dwo drs dws dms < "$file"
-      printf '%s{"offsetMs":%s,"cpuPct":%s,"memPct":%s,"jobActive":%s,"netRxBytes":%s,"netTxBytes":%s,"ioWaitPct":%s,"diskReadOps":%s,"diskWriteOps":%s,"diskReadSectors":%s,"diskWriteSectors":%s,"diskBusyMs":%s}' "$separator" "$offset" "$cpu" "$memory" "$active" "${netrx:-null}" "${nettx:-null}" "${iowait:-null}" "${dro:-null}" "${dwo:-null}" "${drs:-null}" "${dws:-null}" "${dms:-null}"
+      IFS=' ' read -r offset cpu memory active netrx nettx iowait dro dwo drs dws dms phase < "$file"
+      printf '%s{"offsetMs":%s,"cpuPct":%s,"memPct":%s,"jobActive":%s,"netRxBytes":%s,"netTxBytes":%s,"ioWaitPct":%s,"diskReadOps":%s,"diskWriteOps":%s,"diskReadSectors":%s,"diskWriteSectors":%s,"diskBusyMs":%s%s}' "$separator" "$offset" "$cpu" "$memory" "$active" "${netrx:-null}" "${nettx:-null}" "${iowait:-null}" "${dro:-null}" "${dwo:-null}" "${drs:-null}" "${dws:-null}" "${dms:-null}" "$(phase_field "$phase")"
       separator=,
     done < "$manifest"
     printf ']}'

@@ -1148,8 +1148,11 @@ fi
 # Root-mode boot needs this flag; nonroot Tenki handoff does not depend on it.
 export RUNNER_ALLOW_RUNASROOT=1
 # Its own session and process group (setsid), so a stop reaches the listener, the worker and the job's
-# steps together, not just the shell run.sh started.
-if command -v setsid >/dev/null 2>&1; then setsid ./run.sh --jitconfig "$JIT" & else ./run.sh --jitconfig "$JIT" & fi
+# steps together, not just the shell run.sh started. The runner and the job's steps get GitHub's umask 022
+# (the boot runs under 077 to keep its secrets private): a step's files get the modes it asked for, as on a
+# GitHub-hosted runner. Only that subshell, which exec's the runner so $! stays its pid: the wrapper's own
+# later files keep 077.
+if command -v setsid >/dev/null 2>&1; then (umask 022; exec setsid ./run.sh --jitconfig "$JIT") & else (umask 022; exec ./run.sh --jitconfig "$JIT") & fi
 RUNNER=$!
 
 # Runtime limits, independent of the router (it may be down). One watcher, three rules:

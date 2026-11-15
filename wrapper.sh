@@ -89,20 +89,24 @@ profile_cpu_pct() {
     }
     exit
   }' "$PROCFS/stat" 2>/dev/null)
-  [ -n "$current" ] || { echo null; return; }
+  [ -n "$current" ] || { echo "null null"; return; }
   previous=$(cat "$PROFILE_DIR/previous-cpu" 2>/dev/null)
+  # "BUSY IOWAIT" in percent of the interval's CPU time (#508): iowait is the share the CPUs sat idle
+  # with a request outstanding. Both null when the interval cannot be measured, never 0.
   awk -v c="$current" -v p="$previous" 'BEGIN {
     nc = split(c, cv, " "); np = split(p, pv, " ")
-    if (nc != 8 || np != 8) { print "null"; exit }
+    if (nc != 8 || np != 8) { print "null null"; exit }
     total = 0
     for (i = 1; i <= 8; i++) {
-      if (cv[i] !~ /^[0-9]+$/ || pv[i] !~ /^[0-9]+$/ || cv[i] + 0 < pv[i] + 0) { print "null"; exit }
+      if (cv[i] !~ /^[0-9]+$/ || pv[i] !~ /^[0-9]+$/ || cv[i] + 0 < pv[i] + 0) { print "null null"; exit }
       d[i] = cv[i] - pv[i]; total += d[i]
     }
-    if (total <= 0) { print "null"; exit }
+    if (total <= 0) { print "null null"; exit }
     v = 100 * (total - d[4] - d[5]) / total
     if (v < 0) v = 0; if (v > 100) v = 100
-    printf "%.1f", v
+    w = 100 * d[5] / total
+    if (w < 0) w = 0; if (w > 100) w = 100
+    printf "%.1f %.1f", v, w
   }'
   # Even a counter reset advances the baseline: the next point is a delta from this whole-lifetime
   # observation, never from the job-only file used for the final telemetry.
@@ -153,19 +157,40 @@ net_bytes() {
   [ -n "$value" ] || value="null null"
   printf '%s' "$value"
 }
+# Disk (#508): cumulative reads/writes completed, sectors read/written and milliseconds spent doing
+# I/O, "RO WO RS WS MS", summed over whole-disk block devices only: sd*, vd*, xvd*, hd*, nvme*n* and
+# mmcblk* (a partition would count its bytes twice; loop, ram, zram, dm, md and optical devices are not
+# the VM's disk). Fields 4, 6, 8, 10 and 13 of /proc/diskstats. A row that is short or not numeric is
+# skipped, so a partial file still yields what it can; "null" x5 where nothing is readable.
+# Cumulative, like the network counters, so a lost or replayed sample cannot skew a delta.
+disk_counters() {
+  value=$(awk '
+    $3 ~ /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$/ {
+      if ($4 ~ /^[0-9]+$/ && $6 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+$/ && $10 ~ /^[0-9]+$/ && $13 ~ /^[0-9]+$/) {
+        ro += $4; rs += $6; wo += $8; ws += $10; ms += $13; seen = 1
+      }
+    }
+    END { if (seen) printf "%.0f %.0f %.0f %.0f %.0f", ro, wo, rs, ws, ms }' "$PROCFS/diskstats" 2>/dev/null)
+  [ -n "$value" ] || value="null null null null null"
+  printf '%s' "$value"
+}
 sample_profile() {
   sequence=$(cat "$PROFILE_DIR/sequence" 2>/dev/null)
   case "$sequence" in ''|*[!0-9]*) sequence=0 ;; esac
   sequence=$((sequence + 1))
-  printf '%s
-' "$sequence" > "$PROFILE_DIR/sequence"
   offset=$(profile_offset_ms)
   printf '%s
 ' "$offset" > "$PROFILE_DIR/last-offset"
   name=$(printf 'sample.%010d' "$sequence")
-  printf '%s %s %s %s %s
-' "$offset" "$(profile_cpu_pct)" "$(profile_mem_pct)" "$1" "$(net_bytes)" > "$PROFILE_DIR/$name.tmp.$$"
+  cpuio=$(profile_cpu_pct)
+  # One line per sample: OFFSET CPU MEM ACTIVE RX TX IOWAIT RO WO RS WS MS
+  printf '%s %s %s %s %s %s %s
+' "$offset" "${cpuio% *}" "$(profile_mem_pct)" "$1" "$(net_bytes)" "${cpuio#* }" "$(disk_counters)" > "$PROFILE_DIR/$name.tmp.$$"
   mv "$PROFILE_DIR/$name.tmp.$$" "$PROFILE_DIR/$name"
+  # Counted only once the sample exists: a sampler killed mid-sample leaves the counter where it was, so
+  # "taken" never exceeds what was written (the final sample then reuses that number).
+  printf '%s
+' "$sequence" > "$PROFILE_DIR/sequence"
 }
 sample() {
   if worker_running; then active=true; sample_cpu; else active=false; fi
@@ -193,8 +218,8 @@ post_profiles() (
     printf '{"kind":"samples","samples":['
     separator=
     while IFS= read -r file; do
-      IFS=' ' read -r offset cpu memory active netrx nettx < "$file"
-      printf '%s{"offsetMs":%s,"cpuPct":%s,"memPct":%s,"jobActive":%s,"netRxBytes":%s,"netTxBytes":%s}' "$separator" "$offset" "$cpu" "$memory" "$active" "${netrx:-null}" "${nettx:-null}"
+      IFS=' ' read -r offset cpu memory active netrx nettx iowait dro dwo drs dws dms < "$file"
+      printf '%s{"offsetMs":%s,"cpuPct":%s,"memPct":%s,"jobActive":%s,"netRxBytes":%s,"netTxBytes":%s,"ioWaitPct":%s,"diskReadOps":%s,"diskWriteOps":%s,"diskReadSectors":%s,"diskWriteSectors":%s,"diskBusyMs":%s}' "$separator" "$offset" "$cpu" "$memory" "$active" "${netrx:-null}" "${nettx:-null}" "${iowait:-null}" "${dro:-null}" "${dwo:-null}" "${drs:-null}" "${dws:-null}" "${dms:-null}"
       separator=,
     done < "$manifest"
     printf ']}'
@@ -546,6 +571,13 @@ if [ "$(cat "$LIMIT_FILE" 2>/dev/null)" = cap ]; then
   case "$SEEN_AT" in ''|*[!0-9]*) SEEN_AT= ;; esac
   if [ -n "$SEEN_AT" ] && [ $(($(now_s) - SEEN_AT)) -ge "$MAX_JOB" ]; then RC=124; fi
 fi
+# Why the runner was stopped early, for the profile's coverage note (#509): only the two reasons the
+# watcher writes are reported, and "cap" only when the check above confirmed it (RC rewritten).
+PROFSTOP=null
+case "$(cat "$LIMIT_FILE" 2>/dev/null)" in
+  idle) PROFSTOP='"idle"' ;;
+  cap) [ "$RC" -eq 124 ] && PROFSTOP='"cap"' ;;
+esac
 : > "$PROFILE_DIR/stop"
 kill "$LIMITS" 2>/dev/null || true
 kill "$SAMPLER" "$MARKER" 2>/dev/null || true
@@ -610,6 +642,40 @@ MEMTOTAL=$(num "$(mem_total_mb)")
 # Peak root filesystem use % over the run.
 DISKP=$(num "$(awk '$1 ~ /^[0-9]+$/ && $1 + 0 <= 100 && (m == "" || $1 + 0 > m + 0) { m = $1 } END { if (m != "") print m }' "$DISK" 2>/dev/null)")
 VCPUS=$(num "$(awk '/^cpu[0-9]+ /{n++} END { if (n > 0) print n }' "$PROCFS/stat" 2>/dev/null)")
+
+# Host CPU (#506): what the first processor in /proc/cpuinfo says (model name, family, model, stepping and
+# whether the hypervisor flag is set). JOB-REPORTED like everything here; the server bounds and validates
+# it and uses it only to group and display runs. Each part is null where unreadable, never guessed; the
+# whole object is null when cpuinfo is missing or has no processor block. The model name is reduced to a
+# safe character set here too, which is also what keeps the printf'd JSON below valid.
+HOSTCPU=null
+if [ -r "$PROCFS/cpuinfo" ]; then
+  CPUINFO=$(awk '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    function small(v) { return (v ~ /^[0-9]+$/ && length(v) <= 6) ? v + 0 : "null" }
+    /^[[:space:]]*$/ { if (seen) exit; next }
+    {
+      i = index($0, ":"); if (i == 0) next
+      k = trim(substr($0, 1, i - 1)); v = trim(substr($0, i + 1)); seen = 1
+      if (k == "model name") name = v
+      else if (k == "cpu family") fam = v
+      else if (k == "model") mod = v
+      else if (k == "stepping") step = v
+      else if (k == "flags") hv = ((" " v " ") ~ / hypervisor /) ? "true" : "false"
+    }
+    END { if (seen) printf "%s %s %s %s\n%s\n", small(fam), small(mod), small(step), (hv == "" ? "null" : hv), name }' "$PROCFS/cpuinfo" 2>/dev/null)
+  if [ -n "$CPUINFO" ]; then
+    set -- $(printf '%s
+' "$CPUINFO" | sed -n 1p)
+    CPU_FAM=${1:-null}; CPU_MOD=${2:-null}; CPU_STEP=${3:-null}; CPU_HV=${4:-null}
+    CPU_NAME=$(printf '%s
+' "$CPUINFO" | sed -n 2p | LC_ALL=C tr -cd 'A-Za-z0-9 ().@_/+,:-' | cut -c1-128)
+    if [ -n "$CPU_NAME" ]; then CPU_NAME_JSON=$(printf '"%s"' "$CPU_NAME"); else CPU_NAME_JSON=null; fi
+    HOSTCPU=$(printf '{"model": %s, "family": %s, "modelId": %s, "stepping": %s, "hypervisor": %s}' "$CPU_NAME_JSON" "$CPU_FAM" "$CPU_MOD" "$CPU_STEP" "$CPU_HV")
+  fi
+fi
+# Samples this wrapper took (the sequence counter), so the server can tell how many it never received.
+PROFTAKEN=$(num "$(cat "$PROFILE_DIR/sequence" 2>/dev/null)")
 
 # Seconds since wrapper start of a mark (or now, for poweroff), as a JSON number or null.
 since_start() {
@@ -682,8 +748,8 @@ else
 fi
 case "$PROBE_OUT" in "{"*"}") PROBE_JSON=$PROBE_OUT ;; esac
 
-BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s, "testedSha": %s, "testedRef": %s, "probe": %s}' \
-  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX" "$TESTED_SHA" "$TESTED_REF" "$PROBE_JSON")
+BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s, "testedSha": %s, "testedRef": %s, "probe": %s, "hostCpu": %s, "profileSamplesTaken": %s, "profileStop": %s}' \
+  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX" "$TESTED_SHA" "$TESTED_REF" "$PROBE_JSON" "$HOSTCPU" "$PROFTAKEN" "$PROFSTOP")
 
 curl -fsS -m 10 -X POST "$CIROUTER_TELEMETRY_URL" \
   -H "Authorization: Bearer $TELEMETRY_TOKEN" \

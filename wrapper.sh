@@ -232,6 +232,25 @@ num() {
 }
 
 OOM0=$(awk '/^oom_kill /{print $2}' "$PROCFS/vmstat" 2>/dev/null)
+# OOM kills since this wrapper started, as a JSON number or null (never 0 for "unknown").
+oom_delta() {
+  oom_now=$(awk '/^oom_kill /{print $2}' "$PROCFS/vmstat" 2>/dev/null)
+  case "$OOM0$oom_now" in ''|*[!0-9]*) echo null; return ;; esac
+  if [ -n "$OOM0" ] && [ -n "$oom_now" ] && [ "$oom_now" -ge "$OOM0" ]; then
+    echo $((oom_now - OOM0))
+  else
+    echo null
+  fi
+}
+# Memory high-water % = 1 - min(MemAvailable)/MemTotal over the samples so far; empty when unknown.
+mem_peak_pct() {
+  awk '
+  FNR == NR { if ($1 == "MemTotal:") t = $2; next }
+  $1 ~ /^[0-9]+$/ && (m == "" || $1 + 0 < m + 0) { m = $1 }
+  END { if (t + 0 > 0 && m != "") { v = 100 * (t - m) / t; if (v < 0) v = 0; if (v > 100) v = 100; printf "%.1f", v } }
+  ' "$PROCFS/meminfo" "$MEM" 2>/dev/null
+}
+mem_total_mb() { awk '/^MemTotal:/{printf "%d", $2 / 1024}' "$PROCFS/meminfo" 2>/dev/null; }
 
 ( while :; do sample; sleep "$INTERVAL"; done ) >/dev/null 2>&1 &
 SAMPLER=$!
@@ -476,8 +495,46 @@ stop_runner() {
   done
 ) >/dev/null 2>&1 &
 LIMITS=$!
+
+# Shutdown report (#448). When the guest stops under a running job (SIGTERM/SIGINT/SIGHUP to this
+# wrapper, or a system shutdown that signals it), send ONE final best-effort message so a provider-side
+# VM loss leaves evidence, then die the way the signal would have killed us anyway. It is bounded (at most
+# about 4 s: a 1 s systemctl probe and a 3 s curl), every failure is swallowed, and it never starts the normal
+# exit path: the cap watcher above stays the poweroff backstop, exactly as without the trap.
+# The body is enums and numbers read from /proc only: no env, no command line, no JIT config and no id (the
+# run is in the URL). The router treats it as observation, never as completion or a charge.
+shutdown_report() {
+  sig=$1
+  trap '' TERM INT HUP
+  src=unknown
+  case "$sig" in TERM) src=SIGTERM ;; INT) src=SIGINT ;; HUP) src=SIGHUP ;; esac
+  if command -v systemctl >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      sd_jobs=$(timeout 1 systemctl list-jobs --no-legend </dev/null 2>/dev/null) || sd_jobs=
+    else
+      sd_jobs=$(systemctl list-jobs --no-legend </dev/null 2>/dev/null) || sd_jobs=
+    fi
+    case "$sd_jobs" in
+      *shutdown.target*|*poweroff.target*|*halt.target*|*reboot.target*|*kexec.target*) src=systemd_shutdown ;;
+    esac
+  fi
+  sd_up=$(awk -v a="$UP0" -v b="$(uptime_now)" 'BEGIN { if (a ~ /^[0-9.]+$/ && b ~ /^[0-9.]+$/ && b + 0 >= a + 0) printf "%.2f", b - a }' 2>/dev/null)
+  sd_body=$(printf '{"kind":"shutdown","reason":"shutdown","source":"%s","uptimeSec":%s,"memPct":%s,"memPeakPct":%s,"memTotalMb":%s,"oomKills":%s}' \
+    "$src" "$(num "$sd_up")" "$(profile_mem_pct)" "$(num "$(mem_peak_pct)")" "$(num "$(mem_total_mb)")" "$(oom_delta)")
+  curl -fsS -m 3 --connect-timeout 2 -X POST "$CIROUTER_TELEMETRY_URL" \
+    -H "Authorization: Bearer $TELEMETRY_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "$sd_body" >/dev/null 2>&1 || true
+  trap - TERM INT HUP
+  kill -s "$sig" "$$"
+}
+trap 'shutdown_report TERM' TERM
+trap 'shutdown_report INT' INT
+trap 'shutdown_report HUP' HUP
 wait "$RUNNER"
 RC=$?
+# From here the runner is gone and the normal exit path posts the final telemetry itself.
+trap - TERM INT HUP
 # A runner the watcher stopped at the cap reports the cap, not the signal that ended it. The marker
 # file lives where the job can write (it runs as this user), so it is not trusted alone: a real cap
 # stop only happens once the job has run MAX_JOB seconds, measured from the moment the watcher first
@@ -516,12 +573,7 @@ while [ "$(now_s)" -lt "$FLUSH_DEADLINE" ]; do
   post_profiles >/dev/null 2>&1 || sleep 1
 done
 
-OOM1=$(awk '/^oom_kill /{print $2}' "$PROCFS/vmstat" 2>/dev/null)
-OOMKILLS=null
-case "$OOM0$OOM1" in
-  ''|*[!0-9]*) ;;
-  *) [ -n "$OOM0" ] && [ -n "$OOM1" ] && [ "$OOM1" -ge "$OOM0" ] && OOMKILLS=$((OOM1 - OOM0)) ;;
-esac
+OOMKILLS=$(oom_delta)
 
 # CPU, first to last job sample (none or one = unknown, never a lifetime fallback),
 # over all 8 jiffy columns. busy = everything but idle and iowait (steal counts as
@@ -552,13 +604,9 @@ CPUSTATS=$(awk '
 set -- $CPUSTATS
 CPUAVG=$(num "${1:-}"); CPUSAT=$(num "${2:-}"); CPUIOW=$(num "${3:-}"); STEAL=$(num "${4:-}"); SAMPLES=$(num "${5:-}")
 
-# Memory high-water % = 1 - min(MemAvailable)/MemTotal; null when unknown.
-MEMP=$(num "$(awk '
-  FNR == NR { if ($1 == "MemTotal:") t = $2; next }
-  $1 ~ /^[0-9]+$/ && (m == "" || $1 + 0 < m + 0) { m = $1 }
-  END { if (t + 0 > 0 && m != "") { v = 100 * (t - m) / t; if (v < 0) v = 0; if (v > 100) v = 100; printf "%.1f", v } }
-  ' "$PROCFS/meminfo" "$MEM" 2>/dev/null)")
-MEMTOTAL=$(num "$(awk '/^MemTotal:/{printf "%d", $2 / 1024}' "$PROCFS/meminfo" 2>/dev/null)")
+# Memory high-water % and total; null when unknown.
+MEMP=$(num "$(mem_peak_pct)")
+MEMTOTAL=$(num "$(mem_total_mb)")
 # Peak root filesystem use % over the run.
 DISKP=$(num "$(awk '$1 ~ /^[0-9]+$/ && $1 + 0 <= 100 && (m == "" || $1 + 0 > m + 0) { m = $1 } END { if (m != "") print m }' "$DISK" 2>/dev/null)")
 VCPUS=$(num "$(awk '/^cpu[0-9]+ /{n++} END { if (n > 0) print n }' "$PROCFS/stat" 2>/dev/null)")

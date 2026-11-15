@@ -13,7 +13,8 @@ JIT=$JIT_CONFIG
 TELEMETRY_TOKEN=$CIROUTER_TELEMETRY_TOKEN
 ADMISSION=${CIROUTER_ADMISSION:-}
 MAX_JOB=${CIROUTER_MAX_JOB_SEC:-}
-unset JIT_CONFIG CIROUTER_TELEMETRY_TOKEN CIROUTER_ADMISSION CIROUTER_MAX_JOB_SEC
+PROBE_HOST=${CIROUTER_PROBE_HOST:-}
+unset JIT_CONFIG CIROUTER_TELEMETRY_TOKEN CIROUTER_ADMISSION CIROUTER_MAX_JOB_SEC CIROUTER_PROBE_HOST
 export LC_ALL=C
 PROCFS=${CI_ROUTER_PROC:-/proc}
 TMPD=${CI_ROUTER_TMP:-/tmp}
@@ -601,8 +602,40 @@ fi
 DURATION=$(( $(now_s) - START ))
 STATUS=failed; [ "$RC" -eq 0 ] && STATUS=done
 
-BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s, "testedSha": %s, "testedRef": %s}' \
-  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX" "$TESTED_SHA" "$TESTED_REF")
+# Post-job RTT probe (#489): TLS connect, TLS handshake and first byte to GitHub's results receiver and
+# to the route's object-store host. No auth, no cookies, no body. The probe script runs in its own
+# process under timeout 5 when the VM has it (a hard 5 s cap whatever a curl does), else in a
+# subshell where each curl is capped at 2 s by its own flags (at most two run). Any error leaves
+# PROBE_JSON null; nothing here can change the exit path, skip the telemetry POST or the poweroff.
+# Timings are curl's, in ms; a failed or timed-out curl reports nothing for its host.
+PROBE_JSON=null
+PROBE_SCRIPT='  probe_one() {
+    # $1 = JSON key, $2 = host. Prints "key": {...} or nothing.
+    t=$(curl -sS -o /dev/null -m 2 --connect-timeout 2 -w '\''%{time_connect} %{time_appconnect} %{time_starttransfer}'\'' "https://$2/" 2>/dev/null) || return 0
+    printf '\''%s
+'\'' "$t" | awk -v k="$1" '\''NF == 3 && $1 ~ /^[0-9.]+$/ && $2 ~ /^[0-9.]+$/ && $3 ~ /^[0-9.]+$/ && $2 > 0 && $3 > 0 {
+      printf "\"%s\": {\"connectMs\": %.0f, \"tlsMs\": %.0f, \"firstByteMs\": %.0f}", k, $1 * 1000, ($2 - $1) * 1000, ($3 - $2) * 1000 }'\''
+  }
+  a=$(probe_one github results-receiver.actions.githubusercontent.com)
+  b=
+  if [ -n "$PROBE_HOST" ]; then b=$(probe_one r2 "$PROBE_HOST"); fi
+  j=
+  for r in "$a" "$b"; do
+    [ -n "$r" ] || continue
+    if [ -n "$j" ]; then j="$j, $r"; else j=$r; fi
+  done
+  [ -n "$j" ] && printf '\''{%s}'\'' "$j"
+'
+PROBE_OUT=
+if command -v timeout >/dev/null 2>&1; then
+  PROBE_OUT=$(PROBE_HOST=$PROBE_HOST timeout 5 sh -c "$PROBE_SCRIPT" </dev/null 2>/dev/null) || PROBE_OUT=
+else
+  PROBE_OUT=$( (PROBE_HOST=$PROBE_HOST; eval "$PROBE_SCRIPT") </dev/null 2>/dev/null ) || PROBE_OUT=
+fi
+case "$PROBE_OUT" in "{"*"}") PROBE_JSON=$PROBE_OUT ;; esac
+
+BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s, "testedSha": %s, "testedRef": %s, "probe": %s}' \
+  "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX" "$TESTED_SHA" "$TESTED_REF" "$PROBE_JSON")
 
 curl -fsS -m 10 -X POST "$CIROUTER_TELEMETRY_URL" \
   -H "Authorization: Bearer $TELEMETRY_TOKEN" \

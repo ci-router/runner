@@ -1069,6 +1069,7 @@ export ACTIONS_RUNNER_HOOK_JOB_STARTED="$PWD/ci-router-job-started.sh"
 # their directory. A probe that fails, times out or cannot be timed reports null for its fields, never 0.
 # The numbers are JOB-REPORTED and shown for comparison only; they feed no billing, placement or authorization.
 HOSTPROBES=null
+HP_OUT=
 if [ "$HOST_PROBES" = 1 ]; then
   HP_DIR="$PWD/.ci-router-fsprobe"
   HP_SEC=${CI_ROUTER_HOSTPROBE_SEC:-5}
@@ -1128,21 +1129,185 @@ rm -rf "$B" 2>/dev/null
 Z=$(ns) && echo "fsProbeMs $(( (Z - F0) / 1000000 ))"
 exit 0
 '
-  HP_OUT=
   if command -v timeout >/dev/null 2>&1; then
     HP_OUT=$(HP_DIR=$HP_DIR HP_FILES=${CI_ROUTER_HOSTPROBE_FILES:-} HP_CHUNK=${CI_ROUTER_HOSTPROBE_CHUNK:-} timeout "$HP_SEC" sh -c "$HP_SCRIPT" </dev/null 2>/dev/null) || true
   else
     HP_OUT=$( (HP_DIR=$HP_DIR; HP_FILES=${CI_ROUTER_HOSTPROBE_FILES:-}; HP_CHUNK=${CI_ROUTER_HOSTPROBE_CHUNK:-}; eval "$HP_SCRIPT") </dev/null 2>/dev/null ) || true
   fi
   rm -rf "$HP_DIR" 2>/dev/null || true
-  # Only the seven known names with plain non-negative integers are kept; anything else is dropped.
-  HOSTPROBES=$(printf '%s
-' "$HP_OUT" | awk '
-    NF == 2 && $2 ~ /^[0-9]+$/ && length($2) <= 15 { m[$1] = $2 }
+fi
+# The boot host probe (#637 step 1): fsync latency and a CPU burst with steal, on EVERY job and every
+# provider, before the runner registers. Data collection only: nothing places, replaces or bills on it.
+# A probe failure never stops or delays a job, so registration waits at most 5 s whatever the probe does:
+# it runs DETACHED in the background, writing to a file under $TMPD, and finishes by creating a done marker. The
+# wrapper polls for that marker with plain shell (no `timeout`, which may be missing, and no signal the probe could
+# ignore) and then goes on. A probe still running at the cap (a `sync` stuck in uninterruptible I/O included) is
+# abandoned: never waited on, never reaped, its result dropped even if it arrives later; it gets a best-effort
+# KILL and its directory is removed in the background. It runs on the real /proc only: a test that points
+# CI_ROUTER_PROC at a fixture gets no probe unless it sets CI_ROUTER_BOOTPROBE=1 (and 0 turns it off). Its lines
+# keep to the boot-prefixed, fsync and steal fields: they never fill the benchmark probe's fields.
+BP_ON=${CI_ROUTER_BOOTPROBE:-}
+if [ -z "$BP_ON" ]; then if [ -z "${CI_ROUTER_PROC:-}" ]; then BP_ON=1; else BP_ON=0; fi; fi
+BP_OUT=
+if [ "$BP_ON" = 1 ]; then
+  BP_DIR="$PWD/.ci-router-bootprobe"
+  # A private mode-0700 directory for the result and done marker: never a fixed name in a shared /tmp.
+  BP_TMP=$(umask 077; mktemp -d "$TMPD/ci-router-bootprobe.XXXXXX" 2>/dev/null) || BP_TMP=
+  [ -n "$BP_TMP" ] && [ -d "$BP_TMP" ] || BP_ON=0
+fi
+if [ "$BP_ON" = 1 ]; then
+  BP_RES="$BP_TMP/out"
+  BP_DONE="$BP_TMP/done"
+  BP_SEC=${CI_ROUTER_BOOTPROBE_SEC:-5}
+  case "$BP_SEC" in [1-5]) ;; *) BP_SEC=5 ;; esac
+  BP_SCRIPT='FSYNCS=${BP_FSYNCS:-50}
+case "$FSYNCS" in '\'''\''|*[!0-9]*|0) FSYNCS=50 ;; esac
+[ "$FSYNCS" -le 100 ] || FSYNCS=100
+BURST=${BP_BURST_MS:-1500}
+case "$BURST" in '\'''\''|*[!0-9]*|0) BURST=1500 ;; esac
+[ "$BURST" -le 3000 ] || BURST=3000
+CHUNK=${BP_CHUNK:-3000000}
+case "$CHUNK" in '\'''\''|*[!0-9]*|0) CHUNK=3000000 ;; esac
+PROC=${BP_PROC:-/proc}
+B=${BP_DIR:-$PWD/.ci-router-bootprobe}
+ns() {
+  t=$(date +%s%N 2>/dev/null) || return 1
+  case "$t" in '\'''\''|*[!0-9]*) return 1 ;; esac
+  [ "${#t}" -ge 16 ] || return 1
+  printf '\''%s'\'' "$t"
+}
+rm -rf "$B" 2>/dev/null
+mkdir "$B" 2>/dev/null || exit 0
+trap '\''rm -rf "$B" 2>/dev/null'\'' EXIT
+# --- fsync latency ---
+F0=$(ns) || F0=
+if [ -n "$F0" ] && : > "$B/clean" 2>/dev/null && sync "$B/clean" 2>/dev/null; then
+  BLK=$(awk '\''BEGIN { s = "x"; for (i = 0; i < 10; i++) s = s s; printf "%s", s }'\'')
+  # The timing overhead: the same two clock reads and a sync of a file with nothing dirty.
+  : > "$B/base"
+  i=0
+  while [ "$i" -lt 7 ]; do
+    a=$(ns) || break
+    sync "$B/clean" 2>/dev/null
+    z=$(ns) || break
+    echo $((z - a)) >> "$B/base"
+    i=$((i + 1))
+  done
+  OVER=$(sort -n "$B/base" 2>/dev/null | awk '\''{ v[NR] = $1 } END { if (NR > 0) print v[int((NR + 1) / 2)]; else print 0 }'\'')
+  case "$OVER" in '\'''\''|*[!0-9]*) OVER=0 ;; esac
+  : > "$B/f"
+  : > "$B/lat"
+  n=0
+  while [ "$n" -lt "$FSYNCS" ]; do
+    a=$(ns) || break
+    printf '\''%s'\'' "$BLK" >> "$B/f" 2>/dev/null || break
+    sync "$B/f" 2>/dev/null || break
+    z=$(ns) || break
+    d=$(( (z - a - OVER) / 1000 ))
+    [ "$d" -ge 0 ] || d=0
+    echo "$d" >> "$B/lat"
+    n=$((n + 1))
+    [ $(( (z - F0) / 1000000 )) -lt 1500 ] || break
+  done
+  Z=$(ns) || Z=
+  if [ "$n" -gt 0 ] && [ -n "$Z" ]; then
+    sort -n "$B/lat" | awk '\''{ v[NR] = $1; s += $1 }
+      END { if (NR == 0) exit
+        k = int(NR * 0.95); if (k < NR * 0.95) k++; if (k < 1) k = 1
+        printf "fsyncMeanUs %.0f\nfsyncP95Us %d\nfsyncSamples %d\n", s / NR, v[k], NR }'\''
+    echo "bootFsProbeMs $(( (Z - F0) / 1000000 ))"
+  fi
+fi
+# --- CPU burst and steal ---
+cpu_line() { awk '\''NR == 1 && $1 == "cpu" { print $2, $3, $4, $5, $6, $7, $8, $9; exit }'\'' "$PROC/stat" 2>/dev/null; }
+W=$(grep -c '\''^processor'\'' "$PROC/cpuinfo" 2>/dev/null) || W=
+case "$W" in '\'''\''|*[!0-9]*|0) W=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || W=1 ;; esac
+case "$W" in '\'''\''|*[!0-9]*|0) W=1 ;; esac
+[ "$W" -le 16 ] || W=16
+S0=$(cpu_line)
+T0=$(ns) || T0=
+if [ -n "$S0" ] && [ -n "$T0" ]; then
+  LIMIT=$((BURST * 1000000))
+  w=0
+  while [ "$w" -lt "$W" ]; do
+    (
+      c=0; S=$(ns) || exit 0
+      while :; do
+        awk -v n="$CHUNK" '\''BEGIN { x = 1; for (i = 0; i < n; i++) x = (x * 69069 + 1) % 4294967296; if (x < 0) exit 1 }'\'' || exit 0
+        c=$((c + 1))
+        E=$(ns) || exit 0
+        [ $((E - S)) -lt "$LIMIT" ] || break
+      done
+      echo "$c $((E - S))" > "$B/w$w"
+    ) >/dev/null 2>&1 &
+    w=$((w + 1))
+  done
+  wait
+  T1=$(ns) || T1=
+  S1=$(cpu_line)
+  if [ -n "$T1" ] && [ -n "$S1" ]; then
+    echo "$S0 $S1" | awk '\''{ t0 = 0; t1 = 0; for (i = 1; i <= 8; i++) { t0 += $i; t1 += $(i + 8) }
+      dt = t1 - t0; if (dt > 0) printf "cpuStealPct %.2f\n", ($16 - $8) * 100 / dt }'\''
+    cat "$B"/w[0-9]* 2>/dev/null | awk -v chunk="$CHUNK" -v want="$W" '\''
+      NF == 2 && $1 > 0 && $2 > 0 { r += $1 * chunk * 1e9 / $2; n++ }
+      END { if (n == want && n > 0) printf "bootCpuScore %.0f\n", r / n }'\''
+    echo "bootCpuProbeMs $(( (T1 - T0) / 1000000 ))"
+  fi
+fi
+exit 0
+'
+  BP_PROC=$PROCFS; BP_FSYNCS=${CI_ROUTER_BOOTPROBE_FSYNCS:-}
+  BP_BURST_MS=${CI_ROUTER_BOOTPROBE_BURST_MS:-}; BP_CHUNK=${CI_ROUTER_BOOTPROBE_CHUNK:-}
+  export BP_DIR BP_PROC BP_FSYNCS BP_BURST_MS BP_CHUNK BP_SCRIPT BP_DONE
+  # Its own session and process group (setsid, where present), so an abandoned probe is killed with all
+  # of its descendants (sync, the CPU workers), not only its top shell.
+  BP_RUN='sh -c "$BP_SCRIPT" || true; : > "$BP_DONE"'
+  BP_GRP=
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh -c "$BP_RUN" </dev/null >"$BP_RES" 2>/dev/null &
+    BP_GRP=1
+  else
+    sh -c "$BP_RUN" </dev/null >"$BP_RES" 2>/dev/null &
+  fi
+  BP_PID=$!
+  unset BP_SCRIPT BP_RUN
+  BP_T0=$(date +%s 2>/dev/null) || BP_T0=
+  case "$BP_T0" in ''|*[!0-9]*) BP_T0= ;; esac
+  BP_N=0
+  BP_MAX=$((BP_SEC * 10))
+  while [ ! -e "$BP_DONE" ]; do
+    BP_N=$((BP_N + 1))
+    [ "$BP_N" -le "$BP_MAX" ] || break
+    if [ -n "$BP_T0" ]; then
+      BP_T1=$(date +%s 2>/dev/null) || BP_T1=
+      case "$BP_T1" in ''|*[!0-9]*) ;; *) [ $((BP_T1 - BP_T0)) -lt "$BP_SEC" ] || break ;; esac
+    fi
+    sleep 0.1 2>/dev/null || true
+  done
+  if [ -e "$BP_DONE" ]; then
+    BP_OUT=$(head -c 4096 "$BP_RES" 2>/dev/null) || BP_OUT=
+    rm -rf "$BP_DIR" "$BP_TMP" 2>/dev/null || true
+  else
+    # Abandoned: best-effort KILL of its whole process group (a process in D state ignores it), then remove
+    # its files without waiting. The done marker is checked again first: a probe that just finished may have
+    # been reaped, and its pid reused by something else.
+    (
+      if [ ! -e "$BP_DONE" ]; then
+        if [ -n "$BP_GRP" ]; then kill -KILL "-$BP_PID" 2>/dev/null; fi
+        pkill -KILL -P "$BP_PID" 2>/dev/null; kill -KILL "$BP_PID" 2>/dev/null
+      fi
+      rm -rf "$BP_DIR" "$BP_TMP" 2>/dev/null
+    ) </dev/null >/dev/null 2>&1 &
+  fi
+fi
+if [ -n "$BP_OUT$HP_OUT" ]; then
+  # Only the known names with plain non-negative numbers are kept; anything else is dropped.
+  HOSTPROBES=$(printf '%s\n%s\n' "$BP_OUT" "$HP_OUT" | awk '
+    NF == 2 && $2 ~ /^[0-9]+(\.[0-9]+)?$/ && length($2) <= 15 { m[$1] = $2 }
     function v(k) { return (k in m) ? m[k] : "null" }
     END {
-      if (!(("cpuScore" in m) || ("fsCreateOpsPerSec" in m) || ("fsStatOpsPerSec" in m) || ("fsLinkOpsPerSec" in m))) { print "null"; exit }
-      printf "{\"cpuScore\": %s, \"cpuProbeMs\": %s, \"fsFiles\": %s, \"fsCreateOpsPerSec\": %s, \"fsStatOpsPerSec\": %s, \"fsLinkOpsPerSec\": %s, \"fsProbeMs\": %s}\n", v("cpuScore"), v("cpuProbeMs"), v("fsFiles"), v("fsCreateOpsPerSec"), v("fsStatOpsPerSec"), v("fsLinkOpsPerSec"), v("fsProbeMs")
+      if (!(("cpuScore" in m) || ("fsCreateOpsPerSec" in m) || ("fsStatOpsPerSec" in m) || ("fsLinkOpsPerSec" in m) || ("bootCpuScore" in m) || ("fsyncMeanUs" in m) || ("cpuStealPct" in m))) { print "null"; exit }
+      printf "{\"cpuScore\": %s, \"cpuProbeMs\": %s, \"fsFiles\": %s, \"fsCreateOpsPerSec\": %s, \"fsStatOpsPerSec\": %s, \"fsLinkOpsPerSec\": %s, \"fsProbeMs\": %s, \"fsyncMeanUs\": %s, \"fsyncP95Us\": %s, \"fsyncSamples\": %s, \"cpuStealPct\": %s, \"bootCpuScore\": %s, \"bootCpuProbeMs\": %s, \"bootFsProbeMs\": %s}\n", v("cpuScore"), v("cpuProbeMs"), v("fsFiles"), v("fsCreateOpsPerSec"), v("fsStatOpsPerSec"), v("fsLinkOpsPerSec"), v("fsProbeMs"), v("fsyncMeanUs"), v("fsyncP95Us"), v("fsyncSamples"), v("cpuStealPct"), v("bootCpuScore"), v("bootCpuProbeMs"), v("bootFsProbeMs")
     }' 2>/dev/null)
   case "$HOSTPROBES" in "{"*"}") ;; *) HOSTPROBES=null ;; esac
 fi

@@ -1318,7 +1318,15 @@ export RUNNER_ALLOW_RUNASROOT=1
 # (the boot runs under 077 to keep its secrets private): a step's files get the modes it asked for, as on a
 # GitHub-hosted runner. Only that subshell, which exec's the runner so $! stays its pid: the wrapper's own
 # later files keep 077.
-if command -v setsid >/dev/null 2>&1; then (umask 022; exec setsid ./run.sh --jitconfig "$JIT") & else (umask 022; exec ./run.sh --jitconfig "$JIT") & fi
+# The job's steps also get the default handling of HUP, INT and QUIT, as on a GitHub-hosted runner. A
+# background job of this non-interactive shell starts with INT and QUIT ignored, a provider's boot may
+# start this wrapper with HUP ignored, and a signal ignored at exec stays ignored in every step, where
+# bash cannot even trap it (a step's own cleanup on SIGINT or SIGHUP never ran). env --default-signal
+# (coreutils 8.31+) resets them right before run.sh; without it the runner starts as before. Only with
+# setsid: without its own session the runner would share the boot's, whose disconnect HUP would then end it.
+DEFSIG=
+if env --default-signal=HUP,INT,QUIT true 2>/dev/null; then DEFSIG='env --default-signal=HUP,INT,QUIT'; fi
+if command -v setsid >/dev/null 2>&1; then (umask 022; exec setsid $DEFSIG ./run.sh --jitconfig "$JIT") & else (umask 022; exec ./run.sh --jitconfig "$JIT") & fi
 RUNNER=$!
 
 # Runtime limits, independent of the router (it may be down). One watcher, three rules:

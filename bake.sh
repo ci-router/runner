@@ -21,7 +21,7 @@ quiet() {
 }
 apt_install() { quiet apt-get install -y -qq "$@"; }
 apt-get update -qq
-apt_install --no-install-recommends curl ca-certificates xz-utils build-essential
+apt_install --no-install-recommends curl ca-certificates xz-utils build-essential chrony
 # Node 22.23.5 from nodejs.org, pinned with its published sha256.
 NODE_DIR=$(mktemp -d)
 curl -fsSL -o "$NODE_DIR/node-v22.23.5-linux-x64.tar.xz" https://nodejs.org/dist/v22.23.5/node-v22.23.5-linux-x64.tar.xz

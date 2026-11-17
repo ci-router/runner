@@ -12,8 +12,41 @@ jobs:
         with:
           persist-credentials: false
       - run: docker build --pull -t ci-router-runner-check .
+      - name: Measure generated image and Alpine runtimes
+        run: |
+          docker image inspect ci-router-runner-check --format 'Image={{.Id}} os={{.Os}} arch={{.Architecture}} bytes={{.Size}}'
+          docker run --rm --network none --entrypoint sh ci-router-runner-check -c \
+            'du -sb /opt/actions-runner/externals/node20_alpine /opt/actions-runner/externals/node24_alpine'
       - run: >-
           docker run --rm --network none --entrypoint node
           --add-host ci-router-override.localhost:127.0.0.2
           --mount type=bind,src="$PWD/localhost-smoke.cjs",dst=/tmp/localhost-smoke.cjs,readonly
           ci-router-runner-check /tmp/localhost-smoke.cjs --connect
+      - name: Run Alpine JavaScript action runtimes
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "$RUNNER_TEMP/alpine-node.XXXXXX")"
+          cid=
+          cleanup() {
+            if [ -n "$cid" ]; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+          mkdir -p "$work/externals"
+          cid="$(docker create ci-router-runner-check)"
+          for runtime in node20_alpine node24_alpine; do
+            docker cp "$cid:/opt/actions-runner/externals/$runtime" "$work/externals/"
+          done
+          docker pull alpine:3.22
+          docker image inspect alpine:3.22 --format 'Alpine image={{.Id}} arch={{.Architecture}} digests={{json .RepoDigests}}'
+          for runtime in node20_alpine node24_alpine; do
+            major="${runtime#node}"
+            major="${major%_alpine}"
+            docker run --rm --network none \
+              --mount "type=bind,src=$work/externals,dst=/__e,readonly" \
+              --mount "type=bind,src=$PWD/alpine-js-action-smoke.cjs,dst=/tmp/alpine-js-action-smoke.cjs,readonly" \
+              --env GITHUB_ACTIONS=true \
+              --env GITHUB_OUTPUT=/tmp/github-output \
+              alpine:3.22 \
+              "/__e/$runtime/bin/node" /tmp/alpine-js-action-smoke.cjs "$runtime" "$major"
+          done

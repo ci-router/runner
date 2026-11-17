@@ -196,7 +196,7 @@ if ! ldconfig -p | grep 'libicuuc\.so\.[0-9]' >/dev/null; then
 fi
 # ICU is required here even if the environment asks for invariant globalization.
 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=0 ./bin/Runner.Listener --version >/dev/null
-# Lean container image: no Alpine node builds (only for Docker `container:` jobs), no package lists.
-rm -rf /opt/actions-runner/externals/node*_alpine /var/lib/apt/lists/* /var/cache/apt/*
+# Keep Alpine Node runtimes for JavaScript actions in Alpine job containers; drop only package lists.
+rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 # Last: the marker says the steps above all finished.
 printf '%s\n' "2.338.2" > /opt/ci-router/baked

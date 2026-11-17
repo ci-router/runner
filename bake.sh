@@ -29,6 +29,139 @@ echo "cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8  $NODE_DI
 tar xJf "$NODE_DIR/node-v22.23.5-linux-x64.tar.xz" -C /usr/local --strip-components=1 --exclude='*.md' --exclude=LICENSE
 rm -rf "$NODE_DIR"
 node --version >/dev/null
+if ! (
+  getconf GNU_LIBC_VERSION >/dev/null 2>&1 || exit 1
+  ci_router_localhost_configure() {
+    'node' - /etc/nsswitch.conf "$@" <<'CI_ROUTER_LOCALHOST_CONFIG_EOF' >/dev/null 2>&1
+
+const fs = require('node:fs');
+const { randomUUID } = require('node:crypto');
+const path = fs.realpathSync(process.argv[2]);
+const stat = fs.statSync(path);
+const original = fs.readFileSync(path, 'utf8');
+let count = 0;
+const updated = original.replace(/^([ \t]*hosts[ \t]*:)([^\n]*)$/gm, (_line, prefix, rest) => {
+  count++;
+  const commentAt = rest.indexOf('#');
+  const comment = commentAt < 0 ? '' : rest.slice(commentAt);
+  let policy = (commentAt < 0 ? rest : rest.slice(0, commentAt)).trim();
+  const groups = [];
+  while (policy) {
+    const service = /^([a-zA-Z0-9_-]+)(?=\s|$)/.exec(policy);
+    if (!service) throw new Error('unsupported hosts policy');
+    policy = policy.slice(service[0].length).trimStart();
+    const actions = [];
+    while (policy.startsWith('[')) {
+      const action = /^\[[^\[\]]+\](?=\s|$)/.exec(policy);
+      if (!action) throw new Error('unsupported hosts action');
+      actions.push(action[0]);
+      policy = policy.slice(action[0].length).trimStart();
+    }
+    if (service[1] === 'myhostname') {
+      if (actions.length) throw new Error('custom myhostname actions');
+    } else groups.push({ service: service[1], actions });
+  }
+  const files = groups.findIndex((group) => group.service === 'files');
+  if (files > 0 || groups.filter((group) => group.service === 'files').length > 1)
+    throw new Error('unsupported files ordering');
+  if (files === 0) {
+    const outcomes = { SUCCESS: 'return', NOTFOUND: 'continue', UNAVAIL: 'continue', TRYAGAIN: 'continue' };
+    for (const block of groups[0].actions) {
+      for (const rule of block.slice(1, -1).trim().split(/\s+/)) {
+        const match = /^(!?)(SUCCESS|NOTFOUND|UNAVAIL|TRYAGAIN)=(return|continue|merge)$/i.exec(rule);
+        if (!match) throw new Error('unsupported files action');
+        for (const status of Object.keys(outcomes)) {
+          if ((status === match[2].toUpperCase()) !== Boolean(match[1])) outcomes[status] = match[3].toLowerCase();
+        }
+      }
+    }
+    if (outcomes.SUCCESS !== 'return' || outcomes.NOTFOUND !== 'continue')
+      throw new Error('files prevents localhost precedence');
+  }
+  groups.splice(files === 0 ? 1 : 0, 0, { service: 'myhostname', actions: [] });
+  return prefix + ' ' + groups.map((group) => [group.service, ...group.actions].join(' ')).join(' ') + (comment ? ' ' + comment : '');
+});
+if (count !== 1) throw new Error('expected one hosts policy');
+if (updated !== original && process.argv[3] !== '--check') {
+  const temporary = path + '.ci-router-' + randomUUID();
+  let fd;
+  try {
+    fd = fs.openSync(temporary, 'wx', stat.mode & 0o7777);
+    fs.fchownSync(fd, stat.uid, stat.gid);
+    fs.fchmodSync(fd, stat.mode & 0o7777);
+    fs.writeFileSync(fd, updated);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(temporary, path);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
+}
+CI_ROUTER_LOCALHOST_CONFIG_EOF
+  }
+  ci_router_localhost_configure --check || exit 1
+  if ! getent -s myhostname hosts app.localhost >/dev/null 2>&1; then
+    timeout --kill-after=5 30 apt-get -o DPkg::Lock::Timeout=5 -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 update -qq >/dev/null 2>&1 || exit 1
+    timeout --kill-after=5 30 apt-get -o DPkg::Lock::Timeout=5 -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y -qq --no-install-recommends libnss-myhostname >/dev/null 2>&1 || exit 1
+  fi
+  ci_router_localhost_configure || exit 1
+); then
+  echo 'ci-router: localhost resolver setup unavailable' >&2
+  exit 1
+fi
+'node' <<'CI_ROUTER_LOCALHOST_SMOKE_EOF'
+
+const dns = require('node:dns').promises;
+const timer = setTimeout(() => process.exit(1), 10000);
+(async () => {
+  for (const name of ['localhost', 'app.localhost', 'nested.app.localhost']) {
+    for (const family of [4, 6]) {
+      const result = await dns.lookup(name, { family });
+      if (result.address !== (family === 4 ? '127.0.0.1' : '::1')) throw new Error('not loopback');
+    }
+  }
+  if (process.argv.includes('--connect')) {
+    const net = require('node:net');
+    if ((await dns.lookup('ci-router-override.localhost', { family: 4 })).address !== '127.0.0.2')
+      throw new Error('hosts override lost');
+    for (const family of [4, 6, 0]) {
+      const server = net.createServer((socket) => socket.end('loopback'));
+      try {
+        const host = family === 4 ? '127.0.0.1' : family === 6 ? '::1' : undefined;
+        await new Promise((resolve, reject) => server.once('error', reject).listen({ port: 0, ...(host ? { host } : {}) }, resolve));
+      } catch (error) {
+        if (family === 6 && ['EAFNOSUPPORT', 'EADDRNOTAVAIL'].includes(error.code)) {
+          console.log('ci-router: IPv6 socket unavailable; IPv6 lookup passed');
+          continue;
+        }
+        throw error;
+      }
+      try {
+        await new Promise((resolve, reject) => {
+          const socket = net.connect({ host: 'app.localhost', port: server.address().port, ...(family ? { family } : {}) });
+          socket.setTimeout(2000, () => socket.destroy(new Error('connection timeout')));
+          let body = '';
+          socket.on('data', (chunk) => body += chunk);
+          socket.on('error', reject);
+          socket.on('end', () => { if (body === 'loopback') resolve(); else reject(new Error('invalid response')); });
+        });
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+      console.log(family ? 'ci-router: IPv' + family + ' explicit connection passed' : 'ci-router: default connection passed');
+    }
+  }
+})().then(() => {
+  clearTimeout(timer);
+  console.log('ci-router: localhost resolver smoke passed');
+}, () => {
+  clearTimeout(timer);
+  console.error('ci-router: localhost resolver smoke failed');
+  process.exitCode = 1;
+});
+CI_ROUTER_LOCALHOST_SMOKE_EOF
+
 # Rust 1.99.1 via a pinned rustup-init (1.29.3), minimal profile. The toolchain binaries go on
 # /usr/local/bin straight from the pinned toolchain dir; rustup is linked too, and RUSTUP_HOME / CARGO_HOME
 # are exported for login shells (profile.d) and for non-login runner shells (/etc/environment).

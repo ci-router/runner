@@ -1,0 +1,19 @@
+name: check
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: docker build --pull -t ci-router-runner-check .
+      - run: >-
+          docker run --rm --network none --entrypoint node
+          --add-host ci-router-override.localhost:127.0.0.2
+          --mount type=bind,src="$PWD/localhost-smoke.cjs",dst=/tmp/localhost-smoke.cjs,readonly
+          ci-router-runner-check /tmp/localhost-smoke.cjs --connect

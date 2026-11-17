@@ -1504,35 +1504,45 @@ MEMTOTAL=$(num "$(mem_total_mb)")
 DISKP=$(num "$(awk '$1 ~ /^[0-9]+$/ && $1 + 0 <= 100 && (m == "" || $1 + 0 > m + 0) { m = $1 } END { if (m != "") print m }' "$DISK" 2>/dev/null)")
 VCPUS=$(num "$(awk '/^cpu[0-9]+ /{n++} END { if (n > 0) print n }' "$PROCFS/stat" 2>/dev/null)")
 
-# Host CPU (#506): what the first processor in /proc/cpuinfo says (model name, family, model, stepping and
-# whether the hypervisor flag is set). JOB-REPORTED like everything here; the server bounds and validates
+# Guest-visible CPU (#506): the first processor model/descriptor, family, model id, stepping and
+# hypervisor flag. JOB-REPORTED like everything here; the server bounds and validates
 # it and uses it only to group and display runs. Each part is null where unreadable, never guessed; the
-# whole object is null when cpuinfo is missing or has no processor block. The model name is reduced to a
+# missing/unknown model can use a CPUID brand or literal vendor/family/model descriptor, never an
+# inferred physical SKU. Without cpuinfo or a brand the object is null. The name is reduced to a
 # safe character set here too, which is also what keeps the printf'd JSON below valid.
 HOSTCPU=null
+CPUINFO=; CPU_NAME=; CPU_DESCRIPTOR=
+CPU_FAM=null; CPU_MOD=null; CPU_STEP=null; CPU_HV=null
 if [ -r "$PROCFS/cpuinfo" ]; then
   CPUINFO=$(awk '
     function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-    function small(v) { return (v ~ /^[0-9]+$/ && length(v) <= 6) ? v + 0 : "null" }
+    function small(v) { return (v ~ /^[0-9]+$/ && length(v) <= 6 && v + 0 <= 100000) ? v + 0 : "null" }
     /^[[:space:]]*$/ { if (seen) exit; next }
     {
       i = index($0, ":"); if (i == 0) next
       k = trim(substr($0, 1, i - 1)); v = trim(substr($0, i + 1)); seen = 1
       if (k == "model name") name = v
+      else if (k == "vendor_id") vendor = v
       else if (k == "cpu family") fam = v
       else if (k == "model") mod = v
       else if (k == "stepping") step = v
       else if (k == "flags") hv = ((" " v " ") ~ / hypervisor /) ? "true" : "false"
     }
-    END { if (seen) printf "%s %s %s %s\n%s\n", small(fam), small(mod), small(step), (hv == "" ? "null" : hv), name }' "$PROCFS/cpuinfo" 2>/dev/null)
+    END {
+      fam = small(fam); mod = small(mod); step = small(step)
+      if (tolower(name) == "unknown") name = ""
+      if (name == "" && vendor ~ /^[A-Za-z0-9_-]+$/ && length(vendor) <= 12 && tolower(vendor) != "unknown" && fam != "null" && mod != "null")
+        descriptor = "x86 " vendor " family " fam " model " mod
+      if (seen) printf "%s %s %s %s\n%s\n%s\n", fam, mod, step, (hv == "" ? "null" : hv), name, descriptor
+    }' "$PROCFS/cpuinfo" 2>/dev/null)
   if [ -n "$CPUINFO" ]; then
     set -- $(printf '%s
 ' "$CPUINFO" | sed -n 1p)
     CPU_FAM=${1:-null}; CPU_MOD=${2:-null}; CPU_STEP=${3:-null}; CPU_HV=${4:-null}
     CPU_NAME=$(printf '%s
 ' "$CPUINFO" | sed -n 2p | LC_ALL=C tr -cd 'A-Za-z0-9 ().@_/+,:-' | cut -c1-128)
-    if [ -n "$CPU_NAME" ]; then CPU_NAME_JSON=$(printf '"%s"' "$CPU_NAME"); else CPU_NAME_JSON=null; fi
-    HOSTCPU=$(printf '{"model": %s, "family": %s, "modelId": %s, "stepping": %s, "hypervisor": %s}' "$CPU_NAME_JSON" "$CPU_FAM" "$CPU_MOD" "$CPU_STEP" "$CPU_HV")
+    CPU_DESCRIPTOR=$(printf '%s
+' "$CPUINFO" | sed -n 3p | LC_ALL=C tr -cd 'A-Za-z0-9 ().@_/+,:-' | cut -c1-128)
   fi
 fi
 # Samples this wrapper took (the sequence counter), so the server can tell how many it never received.
@@ -1576,6 +1586,49 @@ fi
 
 DURATION=$(( $(now_s) - START ))
 STATUS=failed; [ "$RC" -eq 0 ] && STATUS=done
+
+# Guest-visible CPUID brand when /proc hides it. One watchdog budget covers compilation and execution;
+# a missing tool, timeout or invalid result leaves the literal descriptor. This runs after duration
+# capture, never changes the job's exit status, and adds only reporting/teardown work, not a calibration.
+if [ -z "$CPU_NAME" ] && command -v cc >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+  CPU_DIR=$(umask 077; mktemp -d "$TMPD/ci-router-cpu.XXXXXX" 2>/dev/null) || CPU_DIR=
+  if [ -n "$CPU_DIR" ]; then
+    cat > "$CPU_DIR/brand.c" <<'CI_ROUTER_CPU_BRAND_EOF'
+#include <stdio.h>
+#include <string.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
+
+int main(void) {
+  char brand[49] = {0};
+#if defined(__x86_64__) || defined(__i386__)
+  if (__get_cpuid_max(0x80000000, NULL) >= 0x80000004) {
+    for (unsigned int leaf = 0; leaf < 3; leaf++) {
+      unsigned int a, b, c, d;
+      __cpuid(0x80000002 + leaf, a, b, c, d);
+      memcpy(brand + leaf * 16, &a, 4);
+      memcpy(brand + leaf * 16 + 4, &b, 4);
+      memcpy(brand + leaf * 16 + 8, &c, 4);
+      memcpy(brand + leaf * 16 + 12, &d, 4);
+    }
+  }
+#endif
+  fputs(brand, stdout);
+  return ferror(stdout) ? 1 : 0;
+}
+CI_ROUTER_CPU_BRAND_EOF
+    CPU_BRAND=$(timeout -s KILL 1 sh -c '[ "$(uname -m 2>/dev/null)" = x86_64 ] && cc -std=c11 -O0 "$1/brand.c" -o "$1/brand" >/dev/null 2>&1 && "$1/brand"' sh "$CPU_DIR" 2>/dev/null) || CPU_BRAND=
+    rm -rf "$CPU_DIR" 2>/dev/null || true
+    CPU_NAME=$(printf '%s' "$CPU_BRAND" | LC_ALL=C tr -cd 'A-Za-z0-9 ().@_/+,:-' | cut -c1-128 | sed 's/^ *//;s/ *$//')
+    if [ "$(printf '%s' "$CPU_NAME" | LC_ALL=C tr 'A-Z' 'a-z')" = unknown ]; then CPU_NAME=; fi
+  fi
+fi
+if [ -z "$CPU_NAME" ]; then CPU_NAME=$CPU_DESCRIPTOR; fi
+if [ -n "$CPUINFO" ] || [ -n "$CPU_NAME" ]; then
+  if [ -n "$CPU_NAME" ]; then CPU_NAME_JSON=$(printf '"%s"' "$CPU_NAME"); else CPU_NAME_JSON=null; fi
+  HOSTCPU=$(printf '{"model": %s, "family": %s, "modelId": %s, "stepping": %s, "hypervisor": %s}' "$CPU_NAME_JSON" "$CPU_FAM" "$CPU_MOD" "$CPU_STEP" "$CPU_HV")
+fi
 
 # Post-job RTT probe (#489): TLS connect, TLS handshake and first byte to GitHub's results receiver and
 # to the route's object-store host. No auth, no cookies, no body. The probe script runs in its own

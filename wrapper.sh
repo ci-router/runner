@@ -1504,13 +1504,20 @@ MEMTOTAL=$(num "$(mem_total_mb)")
 DISKP=$(num "$(awk '$1 ~ /^[0-9]+$/ && $1 + 0 <= 100 && (m == "" || $1 + 0 > m + 0) { m = $1 } END { if (m != "") print m }' "$DISK" 2>/dev/null)")
 VCPUS=$(num "$(awk '/^cpu[0-9]+ /{n++} END { if (n > 0) print n }' "$PROCFS/stat" 2>/dev/null)")
 
-# Guest-visible CPU (#506): the first processor model/descriptor, family, model id, stepping and
-# hypervisor flag. JOB-REPORTED like everything here; the server bounds and validates
-# it and uses it only to group and display runs. Each part is null where unreadable, never guessed; the
-# missing/unknown model can use a CPUID brand or literal vendor/family/model descriptor, never an
-# inferred physical SKU. Without cpuinfo or a brand the object is null. The name is reduced to a
-# safe character set here too, which is also what keeps the printf'd JSON below valid.
+# Guest-visible CPU (#506) and normalized machine architecture (#544). These are observations reported
+# by the guest, not physical-host identity or workflow intent, and never feed routing or billing. CPU
+# details stay null when unreadable; architecture can be reported independently. Only the two uname
+# values this bootstrap supports are mapped; unknown or failed commands stay null.
+# CPU model, family, model id, stepping and hypervisor flag are job-reported. The missing/unknown model
+# can use a CPUID brand or literal vendor/family/model descriptor, never an inferred physical SKU. The
+# name is reduced to a safe character set, keeping the printf'd JSON below valid.
 HOSTCPU=null
+HOST_ARCH=$(uname -m 2>/dev/null) || HOST_ARCH=
+case "$HOST_ARCH" in
+  x86_64) HOST_ARCH='"x64"' ;;
+  aarch64) HOST_ARCH='"arm64"' ;;
+  *) HOST_ARCH=null ;;
+esac
 CPUINFO=; CPU_NAME=; CPU_DESCRIPTOR=
 CPU_FAM=null; CPU_MOD=null; CPU_STEP=null; CPU_HV=null
 if [ -r "$PROCFS/cpuinfo" ]; then
@@ -1625,9 +1632,9 @@ CI_ROUTER_CPU_BRAND_EOF
   fi
 fi
 if [ -z "$CPU_NAME" ]; then CPU_NAME=$CPU_DESCRIPTOR; fi
-if [ -n "$CPUINFO" ] || [ -n "$CPU_NAME" ]; then
+if [ -n "$CPUINFO" ] || [ -n "$CPU_NAME" ] || [ "$HOST_ARCH" != null ]; then
   if [ -n "$CPU_NAME" ]; then CPU_NAME_JSON=$(printf '"%s"' "$CPU_NAME"); else CPU_NAME_JSON=null; fi
-  HOSTCPU=$(printf '{"model": %s, "family": %s, "modelId": %s, "stepping": %s, "hypervisor": %s}' "$CPU_NAME_JSON" "$CPU_FAM" "$CPU_MOD" "$CPU_STEP" "$CPU_HV")
+  HOSTCPU=$(printf '{"model": %s, "family": %s, "modelId": %s, "stepping": %s, "hypervisor": %s, "arch": %s}' "$CPU_NAME_JSON" "$CPU_FAM" "$CPU_MOD" "$CPU_STEP" "$CPU_HV" "$HOST_ARCH")
 fi
 
 # Post-job RTT probe (#489): TLS connect, TLS handshake and first byte to GitHub's results receiver and

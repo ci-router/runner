@@ -41,6 +41,8 @@ now_ms() {
 START=$(now_s)
 START_MS=$(now_ms)
 UP0=$(uptime_now)
+MARKS="$TMPD/ci-router-marks"
+: > "$MARKS"
 
 CPU="$TMPD/ci-router-cpu"
 MEM="$TMPD/ci-router-mem"
@@ -798,6 +800,38 @@ phase_field() {
     *) printf ',"phase":"%s"' "$1" ;;
   esac
 }
+guest_startup_field() {
+  [ -f "$MARKS" ] || return 0
+  marks=$(
+    {
+      { timeout -k 1 1 dd "if=$MARKS" iflag=nonblock,nofollow bs=257 count=1 status=none 2>/dev/null || printf '?' >&3; } |
+        LC_ALL=C tr -c 'a-z0-9. \n\t' '?'
+    } 3>&1 && printf .
+  ) || return 0
+  case "$marks" in *'?'*) return 0 ;; esac
+  [ "${#marks}" -le 257 ] || return 0
+  snapshot=$(printf '%s' "${marks%.}" | awk -v up0="$UP0" '
+    function decimal(n) { return n ~ /^[0-9]+([.][0-9]+)?$/ }
+    function milliseconds(n) { return sprintf("%.0f", n * 1000) }
+    function offset(n, ms) {
+      ms = milliseconds(n - up0)
+      return (n + 0 < up0 + 0 || ms + 0 > 86400000) ? "null" : ms
+    }
+    BEGIN { listener = worker = "null" }
+    NF {
+      if (NF != 2 || !decimal($2) || ($1 != "up" && $1 != "start" && $1 != "end") || seen[$1]++) bad = 1
+      else if ($1 == "up") listener = offset($2)
+      else if ($1 == "start") worker = offset($2)
+    }
+    END {
+      if (bad || !decimal(up0) || up0 + 0 > 10000000) exit
+      if (listener != "null" && worker != "null" && listener + 0 > worker + 0) exit
+      printf "%s %s %s", milliseconds(up0), listener, worker
+    }') || return 0
+  set -- $snapshot
+  [ "$#" -eq 3 ] || return 0
+  printf ',"guestStartup":{"v":1,"uptimeAtWrapperStartMs":%s,"listenerFirstSeenOffsetMs":%s,"workerFirstSeenOffsetMs":%s}' "$1" "$2" "$3"
+}
 # A single writer avoids overlapping heartbeat requests. One tick per second also makes teardown
 # responsive without signalling a shell that could leave its curl child running beside the final flush.
 post_profiles() (
@@ -822,7 +856,9 @@ post_profiles() (
       printf '%s{"offsetMs":%s,"cpuPct":%s,"memPct":%s,"jobActive":%s,"netRxBytes":%s,"netTxBytes":%s,"ioWaitPct":%s,"diskReadOps":%s,"diskWriteOps":%s,"diskReadSectors":%s,"diskWriteSectors":%s,"diskBusyMs":%s%s}' "$separator" "$offset" "$cpu" "$memory" "$active" "${netrx:-null}" "${nettx:-null}" "${iowait:-null}" "${dro:-null}" "${dwo:-null}" "${drs:-null}" "${dws:-null}" "${dms:-null}" "$(phase_field "$phase")"
       separator=,
     done < "$manifest"
-    printf ']}'
+    printf ']'
+    if [ "${1:-}" = startup ]; then guest_startup_field; fi
+    printf '}'
   )
   if curl -fsS -m 10 -X POST "$CIROUTER_TELEMETRY_URL" \
     -H "Authorization: Bearer $TELEMETRY_TOKEN" \
@@ -843,7 +879,7 @@ post_profiles() (
     sleep 1
     [ ! -f "$PROFILE_DIR/stop" ] || break
     ticks=$((ticks + 1))
-    if [ "$ticks" -ge "$PROFILE_REPORT" ]; then ticks=0; post_profiles || true; fi
+    if [ "$ticks" -ge "$PROFILE_REPORT" ]; then ticks=0; post_profiles startup || true; fi
   done
 ) >/dev/null 2>&1 &
 HEARTBEAT=$!
@@ -885,8 +921,6 @@ SAMPLER=$!
 # so it is also how long the kernel has been up (null where /proc/uptime is unreadable or not the
 # VM's). A watcher notes when the runner listener appears (the JIT config is applied as it starts),
 # when the job's Runner.Worker appears, and when it is gone again. It only reads.
-MARKS="$TMPD/ci-router-marks"
-: > "$MARKS"
 mark() { printf '%s %s\n' "$1" "$(uptime_now)" >> "$MARKS"; }
 (
   up=0; started=0; ended=0

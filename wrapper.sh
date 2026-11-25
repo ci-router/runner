@@ -1345,7 +1345,7 @@ if [ -n "$BP_OUT$HP_OUT" ]; then
     }' 2>/dev/null)
   case "$HOSTPROBES" in "{"*"}") ;; *) HOSTPROBES=null ;; esac
 fi
-# Root-mode boot needs this flag; nonroot Tenki handoff does not depend on it.
+# Root-mode boot needs this flag; nonroot Luxor handoff does not depend on it.
 export RUNNER_ALLOW_RUNASROOT=1
 # Its own session and process group (setsid), so a stop reaches the listener, the worker and the job's
 # steps together, not just the shell run.sh started. The runner and the job's steps get GitHub's umask 022

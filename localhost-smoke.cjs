@@ -1,18 +1,25 @@
 
 const dns = require('node:dns').promises;
-const timer = setTimeout(() => process.exit(1), 10000);
+let step = 'start';
+const timer = setTimeout(() => {
+  console.error('ci-router: localhost resolver smoke timed out at ' + step);
+  process.exit(1);
+}, 10000);
 (async () => {
   for (const name of ['localhost', 'app.localhost', 'nested.app.localhost']) {
     for (const family of [4, 6]) {
+      step = 'lookup ' + name + ' IPv' + family;
       const result = await dns.lookup(name, { family });
-      if (result.address !== (family === 4 ? '127.0.0.1' : '::1')) throw new Error('not loopback');
+      if (result.address !== (family === 4 ? '127.0.0.1' : '::1')) throw new Error('got ' + result.address);
     }
   }
   if (process.argv.includes('--connect')) {
     const net = require('node:net');
+    step = 'hosts override';
     if ((await dns.lookup('ci-router-override.localhost', { family: 4 })).address !== '127.0.0.2')
       throw new Error('hosts override lost');
     for (const family of [4, 6, 0]) {
+      step = 'connect ' + (family ? 'IPv' + family : 'default');
       const server = net.createServer((socket) => socket.end('loopback'));
       try {
         const host = family === 4 ? '127.0.0.1' : family === 6 ? '::1' : undefined;
@@ -42,8 +49,13 @@ const timer = setTimeout(() => process.exit(1), 10000);
 })().then(() => {
   clearTimeout(timer);
   console.log('ci-router: localhost resolver smoke passed');
-}, () => {
+}, (error) => {
   clearTimeout(timer);
-  console.error('ci-router: localhost resolver smoke failed');
+  const reason = String((error && (error.code || error.message)) || 'error').slice(0, 120);
+  let ipv6 = 'no';
+  try {
+    if (require('node:fs').readFileSync('/proc/net/if_inet6', 'utf8').trim()) ipv6 = 'yes';
+  } catch {}
+  console.error('ci-router: localhost resolver smoke failed at ' + step + ': ' + reason + ' (kernel IPv6: ' + ipv6 + ')');
   process.exitCode = 1;
 });

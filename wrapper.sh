@@ -1171,10 +1171,11 @@ exit 0
   rm -rf "$HP_DIR" 2>/dev/null || true
 fi
 # The boot host probe (#637 step 1): fsync latency and a CPU burst with steal, on EVERY job and every
-# provider, before the runner registers. Data collection only: nothing places, replaces or bills on it.
-# A probe failure never stops or delays a job, so registration waits at most 5 s whatever the probe does:
-# it runs DETACHED in the background, writing to a file under $TMPD, and finishes by creating a done marker. The
-# wrapper polls for that marker with plain shell (no `timeout`, which may be missing, and no signal the probe could
+# provider, started just before the runner. Data collection only: nothing places, replaces or bills on it.
+# It never stops or delays a job: the runner starts beside it (waiting for it first delayed every registration
+# by about 2 s, SYL-304), so it shares the VM with the listener's start-up and its network-bound session wait.
+# It runs DETACHED in the background, writing to a file under $TMPD, and finishes by creating a done marker. After
+# the runner has started, the wrapper polls for that marker, at most 5 s from the probe's start, with plain shell (no `timeout`, which may be missing, and no signal the probe could
 # ignore) and then goes on. A probe still running at the cap (a `sync` stuck in uninterruptible I/O included) is
 # abandoned: never waited on, never reaped, its result dropped even if it arrives later; it gets a best-effort
 # KILL and its directory is removed in the background. It runs on the real /proc only: a test that points
@@ -1307,6 +1308,27 @@ exit 0
   unset BP_SCRIPT BP_RUN
   BP_T0=$(date +%s 2>/dev/null) || BP_T0=
   case "$BP_T0" in ''|*[!0-9]*) BP_T0= ;; esac
+fi
+# Root-mode boot needs this flag; nonroot Luxor handoff does not depend on it.
+export RUNNER_ALLOW_RUNASROOT=1
+# Its own session and process group (setsid), so a stop reaches the listener, the worker and the job's
+# steps together, not just the shell run.sh started. The runner and the job's steps get GitHub's umask 022
+# (the boot runs under 077 to keep its secrets private): a step's files get the modes it asked for, as on a
+# GitHub-hosted runner. Only that subshell, which exec's the runner so $! stays its pid: the wrapper's own
+# later files keep 077.
+# The job's steps also get the default handling of HUP, INT and QUIT, as on a GitHub-hosted runner. A
+# background job of this non-interactive shell starts with INT and QUIT ignored, a provider's boot may
+# start this wrapper with HUP ignored, and a signal ignored at exec stays ignored in every step, where
+# bash cannot even trap it (a step's own cleanup on SIGINT or SIGHUP never ran). env --default-signal
+# (coreutils 8.31+) resets them right before run.sh; without it the runner starts as before. Only with
+# setsid: without its own session the runner would share the boot's, whose disconnect HUP would then end it.
+DEFSIG=
+if env --default-signal=HUP,INT,QUIT true 2>/dev/null; then DEFSIG='env --default-signal=HUP,INT,QUIT'; fi
+if command -v setsid >/dev/null 2>&1; then (umask 022; exec setsid $DEFSIG ./run.sh --jitconfig "$JIT") & else (umask 022; exec ./run.sh --jitconfig "$JIT") & fi
+RUNNER=$!
+# The boot probe has run beside the listener since it started; collect it now (it waits at most the cap
+# from the probe start, so in practice only for what is left of it) for the telemetry post.
+if [ "$BP_ON" = 1 ]; then
   BP_N=0
   BP_MAX=$((BP_SEC * 10))
   while [ ! -e "$BP_DONE" ]; do
@@ -1345,23 +1367,6 @@ if [ -n "$BP_OUT$HP_OUT" ]; then
     }' 2>/dev/null)
   case "$HOSTPROBES" in "{"*"}") ;; *) HOSTPROBES=null ;; esac
 fi
-# Root-mode boot needs this flag; nonroot Luxor handoff does not depend on it.
-export RUNNER_ALLOW_RUNASROOT=1
-# Its own session and process group (setsid), so a stop reaches the listener, the worker and the job's
-# steps together, not just the shell run.sh started. The runner and the job's steps get GitHub's umask 022
-# (the boot runs under 077 to keep its secrets private): a step's files get the modes it asked for, as on a
-# GitHub-hosted runner. Only that subshell, which exec's the runner so $! stays its pid: the wrapper's own
-# later files keep 077.
-# The job's steps also get the default handling of HUP, INT and QUIT, as on a GitHub-hosted runner. A
-# background job of this non-interactive shell starts with INT and QUIT ignored, a provider's boot may
-# start this wrapper with HUP ignored, and a signal ignored at exec stays ignored in every step, where
-# bash cannot even trap it (a step's own cleanup on SIGINT or SIGHUP never ran). env --default-signal
-# (coreutils 8.31+) resets them right before run.sh; without it the runner starts as before. Only with
-# setsid: without its own session the runner would share the boot's, whose disconnect HUP would then end it.
-DEFSIG=
-if env --default-signal=HUP,INT,QUIT true 2>/dev/null; then DEFSIG='env --default-signal=HUP,INT,QUIT'; fi
-if command -v setsid >/dev/null 2>&1; then (umask 022; exec setsid $DEFSIG ./run.sh --jitconfig "$JIT") & else (umask 022; exec ./run.sh --jitconfig "$JIT") & fi
-RUNNER=$!
 
 # Runtime limits, independent of the router (it may be down). One watcher, three rules:
 #  - idle: no Runner.Worker within IDLE seconds of the start = a registered runner nobody sent a job to

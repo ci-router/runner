@@ -114,13 +114,18 @@ fi
 
 const dns = require('node:dns').promises;
 let step = 'start';
+let ipv6 = false;
+try {
+  ipv6 = Boolean(require('node:fs').readFileSync('/proc/net/if_inet6', 'utf8').trim());
+} catch {}
 const timer = setTimeout(() => {
   console.error('ci-router: localhost resolver smoke timed out at ' + step);
   process.exit(1);
 }, 10000);
 (async () => {
+  if (!ipv6) console.log('ci-router: kernel IPv6 unavailable; IPv6 lookups skipped');
   for (const name of ['localhost', 'app.localhost', 'nested.app.localhost']) {
-    for (const family of [4, 6]) {
+    for (const family of ipv6 ? [4, 6] : [4]) {
       step = 'lookup ' + name + ' IPv' + family;
       const result = await dns.lookup(name, { family });
       if (result.address !== (family === 4 ? '127.0.0.1' : '::1')) throw new Error('got ' + result.address);
@@ -165,11 +170,7 @@ const timer = setTimeout(() => {
 }, (error) => {
   clearTimeout(timer);
   const reason = String((error && (error.code || error.message)) || 'error').slice(0, 120);
-  let ipv6 = 'no';
-  try {
-    if (require('node:fs').readFileSync('/proc/net/if_inet6', 'utf8').trim()) ipv6 = 'yes';
-  } catch {}
-  console.error('ci-router: localhost resolver smoke failed at ' + step + ': ' + reason + ' (kernel IPv6: ' + ipv6 + ')');
+  console.error('ci-router: localhost resolver smoke failed at ' + step + ': ' + reason + ' (kernel IPv6: ' + (ipv6 ? 'yes' : 'no') + ')');
   process.exitCode = 1;
 });
 CI_ROUTER_LOCALHOST_SMOKE_EOF

@@ -929,12 +929,16 @@ mark() { printf '%s %s\n' "$1" "$(uptime_now)" >> "$MARKS"; }
 (
   up=0; started=0; ended=0
   while :; do
-    comms=$(cat "$PROCFS"/[0-9]*/comm 2>/dev/null)
-    if [ "$up" = 0 ] && printf '%s\n' "$comms" | grep -qxF 'Runner.Listener'; then mark up; up=1; fi
-    if printf '%s\n' "$comms" | grep -qxF 'Runner.Worker'; then
+    seen_listener=0; seen_worker=0
+    for comm_file in "$PROCFS"/[0-9]*/comm; do
+      read -r comm 2>/dev/null < "$comm_file" || continue
+      case "$comm" in Runner.Listener) seen_listener=1 ;; Runner.Worker) seen_worker=1 ;; esac
+    done
+    if [ "$up" = 0 ] && [ "$seen_listener" = 1 ]; then mark up; up=1; fi
+    if [ "$seen_worker" = 1 ]; then
       if [ "$started" = 0 ]; then mark start; started=1; fi
     elif [ "$started" = 1 ] && [ "$ended" = 0 ]; then mark end; ended=1; fi
-    sleep "${CI_ROUTER_MARK_SEC:-1}"
+    if [ "$started" = 0 ]; then sleep "${CI_ROUTER_MARK_FAST_SEC:-0.1}"; else sleep "${CI_ROUTER_MARK_SEC:-1}"; fi
   done
 ) >/dev/null 2>&1 &
 MARKER=$!

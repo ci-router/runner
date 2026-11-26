@@ -832,8 +832,10 @@ guest_startup_field() {
   [ "$#" -eq 3 ] || return 0
   printf ',"guestStartup":{"v":1,"uptimeAtWrapperStartMs":%s,"listenerFirstSeenOffsetMs":%s,"workerFirstSeenOffsetMs":%s}' "$1" "$2" "$3"
 }
-# A single writer avoids overlapping heartbeat requests. One tick per second also makes teardown
-# responsive without signalling a shell that could leave its curl child running beside the final flush.
+# A single writer avoids overlapping heartbeat requests. At job end the wrapper sends it USR1: a tick's
+# sleep is a background child it waits for, so the signal ends a sleeping heartbeat at once, while one
+# in the middle of a post finishes that post first (a trap waits for the foreground command), so no curl
+# child is left running beside the final flush.
 post_profiles() (
   manifest="$PROFILE_DIR/batch"
   : > "$manifest" || exit 1
@@ -874,9 +876,11 @@ post_profiles() (
   exit "$result"
 )
 (
+  trap 'exit 0' USR1
   ticks=0
   while [ ! -f "$PROFILE_DIR/stop" ]; do
-    sleep 1
+    sleep 1 &
+    wait $!
     [ ! -f "$PROFILE_DIR/stop" ] || break
     ticks=$((ticks + 1))
     if [ "$ticks" -ge "$PROFILE_REPORT" ]; then ticks=0; post_profiles startup || true; fi
@@ -1095,13 +1099,13 @@ TESTED="$PWD/ci-router-tested"
 if [ -n "$ADMISSION" ]; then printf '%s' "$ADMISSION" > ci-router-admission; fi
 export ACTIONS_RUNNER_HOOK_JOB_STARTED="$PWD/ci-router-job-started.sh"
 
-# Host-speed probes (#508, #506): a small-file filesystem probe and a fixed single-core CPU loop, run ONCE
-# before the runner starts, and ONLY when the boot environment says so (CIROUTER_HOST_PROBES=1, set by the
-# router for its internal benchmark and pilot runs, never for a customer job: VM time is billed). The
-# runner has not started, so nothing competes with them. They are capped at 5 s of wall time by
-# `timeout` (and by their own soft deadlines), never fail or delay the boot beyond that, and always remove
-# their directory. A probe that fails, times out or cannot be timed reports null for its fields, never 0.
-# The numbers are JOB-REPORTED and shown for comparison only; they feed no billing, placement or authorization.
+# Host profiling (#508, #506, #637): the small-file filesystem probe and fixed CPU loop, then the boot probe
+# (fsync latency, a CPU burst with steal). They profile the provider, not the job, so they run ONLY in the
+# router's dedicated probe jobs (CIROUTER_HOST_PROBES=1, docs/probe-jobs.md), never in a customer or benchmark
+# job: no job pays start time or shares its CPUs with them. In a probe job they run before the runner starts,
+# on a quiet VM, one after the other. Each is capped (5 s) and never fails or delays the boot beyond that, and
+# both always remove their directories. A probe that fails, times out or cannot be timed reports null for its
+# fields, never 0. The numbers are JOB-REPORTED and feed no billing or authorization.
 HOSTPROBES=null
 HP_OUT=
 if [ "$HOST_PROBES" = 1 ]; then
@@ -1170,19 +1174,18 @@ exit 0
   fi
   rm -rf "$HP_DIR" 2>/dev/null || true
 fi
-# The boot host probe (#637 step 1): fsync latency and a CPU burst with steal, on EVERY job and every
-# provider, started just before the runner. Data collection only: nothing places, replaces or bills on it.
-# It never stops or delays a job: the runner starts beside it (waiting for it first delayed every registration
-# by about 2 s, SYL-304), so it shares the VM with the listener's start-up and its network-bound session wait.
-# It runs DETACHED in the background, writing to a file under $TMPD, and finishes by creating a done marker. After
-# the runner has started, the wrapper polls for that marker, at most 5 s from the probe's start, with plain shell (no `timeout`, which may be missing, and no signal the probe could
-# ignore) and then goes on. A probe still running at the cap (a `sync` stuck in uninterruptible I/O included) is
-# abandoned: never waited on, never reaped, its result dropped even if it arrives later; it gets a best-effort
-# KILL and its directory is removed in the background. It runs on the real /proc only: a test that points
-# CI_ROUTER_PROC at a fixture gets no probe unless it sets CI_ROUTER_BOOTPROBE=1 (and 0 turns it off). Its lines
-# keep to the boot-prefixed, fsync and steal fields: they never fill the benchmark probe's fields.
-BP_ON=${CI_ROUTER_BOOTPROBE:-}
-if [ -z "$BP_ON" ]; then if [ -z "${CI_ROUTER_PROC:-}" ]; then BP_ON=1; else BP_ON=0; fi; fi
+# The boot probe runs DETACHED, writing to a file under $TMPD, and finishes by creating a done marker. The wrapper
+# polls for that marker, at most 5 s from the probe's start, with plain shell (no `timeout`, which may be missing,
+# and no signal the probe could ignore) and then goes on. A probe still running at the cap (a `sync` stuck in
+# uninterruptible I/O included) is abandoned: never waited on, never reaped, its result dropped even if it arrives
+# later; it gets a best-effort KILL and its directory is removed in the background. It runs on the real /proc only:
+# a test that points CI_ROUTER_PROC at a fixture gets no boot probe unless it sets CI_ROUTER_BOOTPROBE=1 (and 0
+# turns it off). Its lines keep to the boot-prefixed, fsync and steal fields: they never fill the host-speed fields.
+BP_ON=0
+if [ "$HOST_PROBES" = 1 ]; then
+  BP_ON=${CI_ROUTER_BOOTPROBE:-}
+  if [ -z "$BP_ON" ]; then if [ -z "${CI_ROUTER_PROC:-}" ]; then BP_ON=1; else BP_ON=0; fi; fi
+fi
 BP_OUT=
 if [ "$BP_ON" = 1 ]; then
   BP_DIR="$PWD/.ci-router-bootprobe"
@@ -1309,25 +1312,7 @@ exit 0
   BP_T0=$(date +%s 2>/dev/null) || BP_T0=
   case "$BP_T0" in ''|*[!0-9]*) BP_T0= ;; esac
 fi
-# Root-mode boot needs this flag; nonroot Luxor handoff does not depend on it.
-export RUNNER_ALLOW_RUNASROOT=1
-# Its own session and process group (setsid), so a stop reaches the listener, the worker and the job's
-# steps together, not just the shell run.sh started. The runner and the job's steps get GitHub's umask 022
-# (the boot runs under 077 to keep its secrets private): a step's files get the modes it asked for, as on a
-# GitHub-hosted runner. Only that subshell, which exec's the runner so $! stays its pid: the wrapper's own
-# later files keep 077.
-# The job's steps also get the default handling of HUP, INT and QUIT, as on a GitHub-hosted runner. A
-# background job of this non-interactive shell starts with INT and QUIT ignored, a provider's boot may
-# start this wrapper with HUP ignored, and a signal ignored at exec stays ignored in every step, where
-# bash cannot even trap it (a step's own cleanup on SIGINT or SIGHUP never ran). env --default-signal
-# (coreutils 8.31+) resets them right before run.sh; without it the runner starts as before. Only with
-# setsid: without its own session the runner would share the boot's, whose disconnect HUP would then end it.
-DEFSIG=
-if env --default-signal=HUP,INT,QUIT true 2>/dev/null; then DEFSIG='env --default-signal=HUP,INT,QUIT'; fi
-if command -v setsid >/dev/null 2>&1; then (umask 022; exec setsid $DEFSIG ./run.sh --jitconfig "$JIT") & else (umask 022; exec ./run.sh --jitconfig "$JIT") & fi
-RUNNER=$!
-# The boot probe has run beside the listener since it started; collect it now (it waits at most the cap
-# from the probe start, so in practice only for what is left of it) for the telemetry post.
+# Collect the boot probe before the runner starts (it waits at most the cap from the probe start).
 if [ "$BP_ON" = 1 ]; then
   BP_N=0
   BP_MAX=$((BP_SEC * 10))
@@ -1367,6 +1352,24 @@ if [ -n "$BP_OUT$HP_OUT" ]; then
     }' 2>/dev/null)
   case "$HOSTPROBES" in "{"*"}") ;; *) HOSTPROBES=null ;; esac
 fi
+
+# Root-mode boot needs this flag; nonroot Luxor handoff does not depend on it.
+export RUNNER_ALLOW_RUNASROOT=1
+# Its own session and process group (setsid), so a stop reaches the listener, the worker and the job's
+# steps together, not just the shell run.sh started. The runner and the job's steps get GitHub's umask 022
+# (the boot runs under 077 to keep its secrets private): a step's files get the modes it asked for, as on a
+# GitHub-hosted runner. Only that subshell, which exec's the runner so $! stays its pid: the wrapper's own
+# later files keep 077.
+# The job's steps also get the default handling of HUP, INT and QUIT, as on a GitHub-hosted runner. A
+# background job of this non-interactive shell starts with INT and QUIT ignored, a provider's boot may
+# start this wrapper with HUP ignored, and a signal ignored at exec stays ignored in every step, where
+# bash cannot even trap it (a step's own cleanup on SIGINT or SIGHUP never ran). env --default-signal
+# (coreutils 8.31+) resets them right before run.sh; without it the runner starts as before. Only with
+# setsid: without its own session the runner would share the boot's, whose disconnect HUP would then end it.
+DEFSIG=
+if env --default-signal=HUP,INT,QUIT true 2>/dev/null; then DEFSIG='env --default-signal=HUP,INT,QUIT'; fi
+if command -v setsid >/dev/null 2>&1; then (umask 022; exec setsid $DEFSIG ./run.sh --jitconfig "$JIT") & else (umask 022; exec ./run.sh --jitconfig "$JIT") & fi
+RUNNER=$!
 
 # Runtime limits, independent of the router (it may be down). One watcher, three rules:
 #  - idle: no Runner.Worker within IDLE seconds of the start = a registered runner nobody sent a job to
@@ -1482,7 +1485,9 @@ esac
 kill "$LIMITS" 2>/dev/null || true
 kill "$SAMPLER" "$MARKER" 2>/dev/null || true
 wait "$SAMPLER" "$MARKER" 2>/dev/null || true
-# Let an in-flight heartbeat finish before the final drain, so no two sample posts can overlap.
+# Let an in-flight heartbeat finish before the final drain, so no two sample posts can overlap; a
+# sleeping one exits at once.
+kill -USR1 "$HEARTBEAT" 2>/dev/null || true
 wait "$HEARTBEAT" 2>/dev/null || true
 # A worker still listed when the runner exited ends with it.
 if grep -q '^start ' "$MARKS" 2>/dev/null && ! grep -q '^end ' "$MARKS" 2>/dev/null; then mark end; fi
@@ -1633,10 +1638,11 @@ fi
 DURATION=$(( $(now_s) - START ))
 STATUS=failed; [ "$RC" -eq 0 ] && STATUS=done
 
-# Guest-visible CPUID brand when /proc hides it. One watchdog budget covers compilation and execution;
-# a missing tool, timeout or invalid result leaves the literal descriptor. This runs after duration
-# capture, never changes the job's exit status, and adds only reporting/teardown work, not a calibration.
-if [ -z "$CPU_NAME" ] && command -v cc >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+# Guest-visible CPUID brand when /proc hides it, in probe jobs only (docs/probe-jobs.md): compiling it costs
+# teardown time that a customer job would pay for, so a customer job keeps the literal descriptor. One
+# watchdog budget covers compilation and execution; a missing tool, timeout or invalid result leaves the
+# descriptor. This runs after duration capture and never changes the job's exit status.
+if [ "$HOST_PROBES" = 1 ] && [ -z "$CPU_NAME" ] && command -v cc >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
   CPU_DIR=$(umask 077; mktemp -d "$TMPD/ci-router-cpu.XXXXXX" 2>/dev/null) || CPU_DIR=
   if [ -n "$CPU_DIR" ]; then
     cat > "$CPU_DIR/brand.c" <<'CI_ROUTER_CPU_BRAND_EOF'
@@ -1676,14 +1682,16 @@ if [ -n "$CPUINFO" ] || [ -n "$CPU_NAME" ] || [ "$HOST_ARCH" != null ]; then
   HOSTCPU=$(printf '{"model": %s, "family": %s, "modelId": %s, "stepping": %s, "hypervisor": %s, "arch": %s}' "$CPU_NAME_JSON" "$CPU_FAM" "$CPU_MOD" "$CPU_STEP" "$CPU_HV" "$HOST_ARCH")
 fi
 
-# Post-job RTT probe (#489): TLS connect, TLS handshake and first byte to GitHub's results receiver and
-# to the route's object-store host. No auth, no cookies, no body. The probe script runs in its own
-# process under timeout 5 when the VM has it (a hard 5 s cap whatever a curl does), else in a
-# subshell where each curl is capped at 2 s by its own flags (at most two run). Any error leaves
-# PROBE_JSON null; nothing here can change the exit path, skip the telemetry POST or the poweroff.
+# RTT probe (#489), in probe jobs only (docs/probe-jobs.md): it measures the route, not the job, and in a
+# customer job it held the teardown (and the billed VM time) for up to 5 s. TLS connect, TLS handshake and
+# first byte to GitHub's results receiver and to the route's object-store host. No auth, no cookies, no body.
+# The probe script runs in its own process under timeout 5 when the VM has it (a hard 5 s cap whatever a curl
+# does), else in a subshell where each curl is capped at 2 s by its own flags (at most two run). Any error
+# leaves PROBE_JSON null; nothing here can change the exit path, skip the telemetry POST or the poweroff.
 # Timings are curl's, in ms; a failed or timed-out curl reports nothing for its host.
 PROBE_JSON=null
-PROBE_SCRIPT='  probe_one() {
+if [ "$HOST_PROBES" = 1 ]; then
+  PROBE_SCRIPT='  probe_one() {
     # $1 = JSON key, $2 = host. Prints "key": {...} or nothing.
     t=$(curl -sS -o /dev/null -m 2 --connect-timeout 2 -w '\''%{time_connect} %{time_appconnect} %{time_starttransfer}'\'' "https://$2/" 2>/dev/null) || return 0
     printf '\''%s
@@ -1700,13 +1708,14 @@ PROBE_SCRIPT='  probe_one() {
   done
   [ -n "$j" ] && printf '\''{%s}'\'' "$j"
 '
-PROBE_OUT=
-if command -v timeout >/dev/null 2>&1; then
-  PROBE_OUT=$(PROBE_HOST=$PROBE_HOST timeout 5 sh -c "$PROBE_SCRIPT" </dev/null 2>/dev/null) || PROBE_OUT=
-else
-  PROBE_OUT=$( (PROBE_HOST=$PROBE_HOST; eval "$PROBE_SCRIPT") </dev/null 2>/dev/null ) || PROBE_OUT=
+  PROBE_OUT=
+  if command -v timeout >/dev/null 2>&1; then
+    PROBE_OUT=$(PROBE_HOST=$PROBE_HOST timeout 5 sh -c "$PROBE_SCRIPT" </dev/null 2>/dev/null) || PROBE_OUT=
+  else
+    PROBE_OUT=$( (PROBE_HOST=$PROBE_HOST; eval "$PROBE_SCRIPT") </dev/null 2>/dev/null ) || PROBE_OUT=
+  fi
+  case "$PROBE_OUT" in "{"*"}") PROBE_JSON=$PROBE_OUT ;; esac
 fi
-case "$PROBE_OUT" in "{"*"}") PROBE_JSON=$PROBE_OUT ;; esac
 
 BODY=$(printf '{"durationSec": %s, "cpuStealPct": %s, "memPeakPct": %s, "cpuAvgPct": %s, "cpuSatPct": %s, "cpuIowaitPct": %s, "diskPeakPct": %s, "oomKills": %s, "samples": %s, "exitCode": %s, "vcpus": %s, "memTotalMb": %s, "status": "%s", "vmUptimeAtStartSec": %s, "runnerUpSec": %s, "jobStartSec": %s, "jobEndSec": %s, "poweroffSec": %s, "netTxBytes": %s, "netRxBytes": %s, "testedSha": %s, "testedRef": %s, "probe": %s, "hostCpu": %s, "hostProbes": %s, "profileSamplesTaken": %s, "profileStop": %s}' \
   "$DURATION" "$STEAL" "$MEMP" "$CPUAVG" "$CPUSAT" "$CPUIOW" "$DISKP" "$OOMKILLS" "$SAMPLES" "$RC" "$VCPUS" "$MEMTOTAL" "$STATUS" "$UPSTART" "$RUNNERUP" "$JOBSTART" "$JOBEND" "$POWEROFFSEC" "$NETTX" "$NETRX" "$TESTED_SHA" "$TESTED_REF" "$PROBE_JSON" "$HOSTCPU" "$HOSTPROBES" "$PROFTAKEN" "$PROFSTOP")
